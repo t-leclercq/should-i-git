@@ -15,6 +15,7 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
+import { GitTree } from "@/components/GitTree";
 
 // Types matching the backend API
 interface GitCommit {
@@ -122,6 +123,47 @@ export function GitWindow() {
   const [tags, setTags] = React.useState<GitTag[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  
+  const [measuredHeaderHeight, setMeasuredHeaderHeight] = React.useState<number>(40);
+  const [rowPositions, setRowPositions] = React.useState<number[]>([]);
+  const [totalTableHeight, setTotalTableHeight] = React.useState<number>(0);
+
+  // Measure table dimensions after render
+  React.useEffect(() => {
+    const measureDimensions = () => {
+      // Find the header row using data attribute
+      const headerRow = document.querySelector('[data-header-row]') as HTMLTableRowElement;
+      let headerHeight = 40;
+      if (headerRow) {
+        headerHeight = headerRow.offsetHeight;
+        setMeasuredHeaderHeight(headerHeight);
+      }
+      
+      // Find all data rows and measure each one
+      const rows = document.querySelectorAll('[data-commit-row]') as NodeListOf<HTMLTableRowElement>;
+      if (rows.length > 0) {
+        const positions: number[] = [];
+        let cumulativeY = headerHeight;
+        
+        rows.forEach((row) => {
+          const rowHeight = row.offsetHeight;
+          // Center of the row is at cumulativeY + half of row height
+          positions.push(cumulativeY + rowHeight / 2);
+          cumulativeY += rowHeight;
+        });
+        
+        setRowPositions(positions);
+        // Total height is the cumulative Y (which is after the last row)
+        setTotalTableHeight(cumulativeY);
+      }
+    };
+
+    // Measure immediately and after a short delay to ensure DOM is fully rendered
+    measureDimensions();
+    const timeoutId = setTimeout(measureDimensions, 0);
+    
+    return () => clearTimeout(timeoutId);
+  }, [commits.length]); // Re-measure when commits change
 
   const fetchCommits = React.useCallback(async () => {
     setLoading(true);
@@ -216,10 +258,26 @@ export function GitWindow() {
         )}
 
         <TabsContent value="commits">
-          <div className="border rounded-lg">
+          <div className="border rounded-lg relative">
+            {commits.length > 0 && rowPositions.length === commits.length && totalTableHeight > 0 && (
+              <div 
+                className="absolute left-0 top-0 w-[80px] pointer-events-none z-10"
+                style={{ height: `${totalTableHeight}px` }}
+              >
+                <GitTree
+                  allCommits={commits}
+                  totalRows={commits.length}
+                  rowPositions={rowPositions}
+                  headerHeight={measuredHeaderHeight}
+                  totalHeight={totalTableHeight}
+                  width={80}
+                />
+              </div>
+            )}
             <Table>
               <TableHeader>
-                <TableRow>
+                <TableRow data-header-row>
+                  <TableHead className="w-[80px]">Tree</TableHead>
                   <TableHead className="w-[100px]">Commit</TableHead>
                   <TableHead>Author</TableHead>
                   <TableHead>Date</TableHead>
@@ -229,15 +287,16 @@ export function GitWindow() {
               <TableBody>
                 {commits.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4} className="text-center text-muted-foreground py-8">
+                    <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
                       {loading ? "Loading commits..." : "No commits fetched. Click 'Fetch Data' to load commits."}
                     </TableCell>
                   </TableRow>
                 ) : (
-                  commits.map((commit) => {
+                  commits.map((commit, index) => {
                     const branchRefs = parseBranchRefs(commit.refs);
                     return (
-                      <TableRow key={commit.commit}>
+                      <TableRow key={commit.commit} data-commit-row>
+                        <TableCell className="p-0" style={{ height: '40px', width: '80px' }} />
                         <TableCell className="font-mono text-xs">
                           <div className="flex flex-col gap-1">
                             <span>{commit.abbreviated_commit}</span>
@@ -297,14 +356,7 @@ export function GitWindow() {
                   branches.map((branch) => (
                     <TableRow key={branch.name}>
                       <TableCell>
-                        <div className="flex items-center gap-2">
-                          {branch.isCurrent && (
-                            <span className="text-xs bg-primary text-primary-foreground px-1.5 py-0.5 rounded">
-                              current
-                            </span>
-                          )}
-                          <span className="font-medium">{branch.name}</span>
-                        </div>
+                        <span className="font-medium">{branch.name}</span>
                       </TableCell>
                       <TableCell className="font-mono text-xs">
                         {branch.abbreviated_commit}
