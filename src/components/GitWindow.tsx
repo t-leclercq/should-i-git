@@ -193,6 +193,9 @@ export function GitWindow(props: GitWindowProps = {}) {
   
   // Fake merge commit state
   const [showFakeMergeCommit, setShowFakeMergeCommit] = React.useState(false);
+  const [isMergeFromReady, setIsMergeFromReady] = React.useState(false);
+  const [shouldMoveFeatureBranchCommits, setShouldMoveFeatureBranchCommits] = React.useState(false);
+  const [lastActionType, setLastActionType] = React.useState<"late" | "ready" | "mistake" | "rollback" | null>(null);
   
   // Reset effect state (remove 876369a and add main badge to ba78722)
   const [showResetEffect, setShowResetEffect] = React.useState(false);
@@ -209,6 +212,10 @@ export function GitWindow(props: GitWindowProps = {}) {
     const action = selectedAction;
     const hasSameFilesChanged = sameFilesChanged;
     
+    // Reset merge flags (will be set appropriately based on action)
+    setIsMergeFromReady(false);
+    setShouldMoveFeatureBranchCommits(false);
+    
     // Close drawer first with confirmation animation
     setTimeout(() => {
       setIsProceeding(false);
@@ -218,6 +225,12 @@ export function GitWindow(props: GitWindowProps = {}) {
       
       // Show message dialog after drawer closes based on selected action
       if (action === "late") {
+        // For "late" action, always move feature-branch commits to top
+        // But only show fake merge commit when checkbox is ticked (after diff dialog merge)
+        setLastActionType("late");
+        setShouldMoveFeatureBranchCommits(true);
+        setIsMergeFromReady(false); // Will be set to true only when merging from diff dialog
+        
         // Small delay to ensure drawer is fully closed
         setTimeout(() => {
           const messages: React.ReactNode[] = hasSameFilesChanged
@@ -250,6 +263,12 @@ export function GitWindow(props: GitWindowProps = {}) {
           setMessageDialogOpen(true);
         }, 300); // Small delay after drawer closes
       } else if (action === "ready") {
+        // Set flag to indicate this is a merge from "ready" action
+        // For "ready" action, don't move feature-branch commits, just add fake merge commit
+        setLastActionType("ready");
+        console.log('Setting isMergeFromReady to true for ready action');
+        setIsMergeFromReady(true);
+        setShouldMoveFeatureBranchCommits(false);
         // Small delay to ensure drawer is fully closed
         setTimeout(() => {
           const messages: React.ReactNode[] = [
@@ -266,6 +285,7 @@ export function GitWindow(props: GitWindowProps = {}) {
           setMessageDialogOpen(true);
         }, 300); // Small delay after drawer closes
       } else if (action === "mistake") {
+        setLastActionType("mistake");
         // Small delay to ensure drawer is fully closed
         setTimeout(() => {
           const messages: React.ReactNode[] = [
@@ -287,6 +307,7 @@ export function GitWindow(props: GitWindowProps = {}) {
           setTreeRemountKey(prev => prev + 1); // Force tree remount
         }, 300); // Small delay after drawer closes
       } else if (action === "rollback") {
+        setLastActionType("rollback");
         // Small delay to ensure drawer is fully closed
         setTimeout(() => {
           const messages: React.ReactNode[] = [
@@ -315,6 +336,8 @@ export function GitWindow(props: GitWindowProps = {}) {
       setSelectedAction(null);
       setIsProceeding(false);
       setSameFilesChanged(false);
+      // Don't reset isMergeFromReady, shouldMoveFeatureBranchCommits, or lastActionType here
+      // They are needed when "Show me!" is clicked after the drawer closes
     }
   }, [drawerOpen]);
   
@@ -375,11 +398,13 @@ export function GitWindow(props: GitWindowProps = {}) {
     const timeoutId1 = setTimeout(measureDimensions, 0);
     const timeoutId2 = setTimeout(measureDimensions, 50); // Additional delay for DOM updates
     const timeoutId3 = setTimeout(measureDimensions, 100); // Another delay for complex updates
+    const timeoutId4 = setTimeout(measureDimensions, 200); // Extra delay when commits are removed
     
     return () => {
       clearTimeout(timeoutId1);
       clearTimeout(timeoutId2);
       clearTimeout(timeoutId3);
+      clearTimeout(timeoutId4);
     };
   }, [paginatedCommits.length, currentPage, showResetEffect, showFakeMergeCommit]); // Re-measure when commits are filtered
 
@@ -481,25 +506,159 @@ export function GitWindow(props: GitWindowProps = {}) {
               // Debug: log showFakeMergeCommit state
               console.log('showFakeMergeCommit:', showFakeMergeCommit);
               
-              // Start with all commits - create new array to ensure reference changes
-              let commitsForTree = paginatedCommits.map(c => ({
-                commit: c.commit,
-                parent: c.parent,
-                refs: c.refs,
-              }));
+              // Build commitsToRender first to know what's actually rendered
+              // This matches what will be rendered in the table below
+              const commitsToRenderForMapping = [...paginatedCommits];
+              if (showResetEffect) {
+                // Remove commits that are filtered out (876369a and 48975f5)
+                const indicesToRemove: number[] = [];
+                commitsToRenderForMapping.forEach((c, idx) => {
+                  if (c.abbreviated_commit === "876369a" || c.abbreviated_commit === "48975f5") {
+                    indicesToRemove.push(idx);
+                    console.log(`GitWindow: Marking commit ${c.abbreviated_commit} for removal at index ${idx}`);
+                  }
+                });
+                indicesToRemove.sort((a, b) => b - a).forEach(idx => {
+                  const removed = commitsToRenderForMapping.splice(idx, 1);
+                  console.log(`GitWindow: Removed commit ${removed[0]?.abbreviated_commit} from commitsToRenderForMapping`);
+                });
+                console.log(`GitWindow: After removal, commitsToRenderForMapping has ${commitsToRenderForMapping.length} commits`);
+                console.log(`GitWindow: First commit is now: ${commitsToRenderForMapping[0]?.abbreviated_commit}`);
+              }
+              
+              // Start with commitsToRenderForMapping - create new array to ensure reference changes
+              let commitsForTree = commitsToRenderForMapping
+                .map(c => ({
+                  commit: c.commit,
+                  parent: c.parent,
+                  refs: c.refs,
+                }));
               
               // Debug: log commits before filtering
               console.log('commitsForTree before filtering:', commitsForTree.length, commitsForTree.map(c => c.commit.substring(0, 7)));
               
-              // Filter out feature-branch commits from tree when fake merge commit is shown
-              if (showFakeMergeCommit) {
+              // When fake merge is shown, conditionally move feature-branch commits (09af298 and 3ad0351) to the top
+              // Only move them when merging from DiffDialog (late action with checkbox), not for "ready" action
+              if (showFakeMergeCommit && shouldMoveFeatureBranchCommits) {
+                // Find and extract feature-branch commits
+                const featureBranchCommits: Array<{ commit: string; parent: string; refs: string }> = [];
                 commitsForTree = commitsForTree.filter(c => {
-                  const branchRefs = parseBranchRefs(c.refs, hideRemoteBranches);
-                  const shouldInclude = !branchRefs.includes("feature-branch");
-                  if (!shouldInclude) {
-                    console.log('Filtering out commit:', c.commit.substring(0, 7), 'branchRefs:', branchRefs);
+                  const isFeatureBranchCommit = c.commit.includes('09af298') || c.commit.includes('3ad0351');
+                  if (isFeatureBranchCommit) {
+                    featureBranchCommits.push(c);
+                    console.log('Extracting feature-branch commit to move to top:', c.commit.substring(0, 7));
                   }
-                  return shouldInclude;
+                  return !isFeatureBranchCommit;
+                });
+                
+                // Change feature-branch commits to main (blue) instead of feature-branch (red)
+                // Only the top commit should have the main badge
+                const updatedFeatureBranchCommits = featureBranchCommits.map((c, idx) => {
+                  const branchRefs = parseBranchRefs(c.refs, hideRemoteBranches);
+                  const refsList = c.refs ? c.refs.split(',').map(r => r.trim()).filter(r => r) : [];
+                  
+                  // Remove feature-branch ref
+                  const updatedRefsList = refsList.filter(r => !r.includes('feature-branch') && !r.includes('HEAD -> feature-branch'));
+                  
+                  // Only add main ref to the first commit (09af298) - it will be at index 0 after reverse
+                  // After reverse, the array will be [09af298, 3ad0351], so idx 0 is 09af298
+                  const is09af298 = c.commit.includes('09af298');
+                  if (is09af298) {
+                    // Add main ref only to 09af298 (top commit)
+                    if (!updatedRefsList.some(r => r.includes('main') || r.includes('HEAD -> main'))) {
+                      updatedRefsList.push("HEAD -> main");
+                    }
+                  } else {
+                    // Remove main ref from 3ad0351 (not the top commit)
+                    const filteredRefsList = updatedRefsList.filter(r => !r.includes('main') && !r.includes('HEAD -> main'));
+                    updatedRefsList.length = 0;
+                    updatedRefsList.push(...filteredRefsList);
+                  }
+                  
+                  return {
+                    ...c,
+                    refs: updatedRefsList.join(', ') || "",
+                  };
+                });
+                
+                // Insert feature-branch commits at the top, maintaining order (09af298 first, then 3ad0351)
+                // Reverse to maintain chronological order (newest first)
+                updatedFeatureBranchCommits.reverse().forEach(commit => {
+                  commitsForTree.unshift(commit);
+                });
+              }
+              
+              // If this is from merge action (ready or late with checkbox), add fake merge commit at the very top
+              if (showFakeMergeCommit && isMergeFromReady) {
+                console.log('Adding fake merge commit to commitsForTree');
+                // Find the latest main branch commit for the fake merge parent
+                // Look in original paginatedCommits to find the true latest main commit
+                const latestMainCommit = paginatedCommits.find(c => {
+                  const branchRefs = parseBranchRefs(c.refs, hideRemoteBranches);
+                  return branchRefs.includes("main");
+                }) || paginatedCommits.find(c => c.abbreviated_commit === "ba78722");
+                
+                // Create fake merge commit for tree
+                const fakeMergeCommitForTree = {
+                  commit: "merge-commit-abc123",
+                  parent: latestMainCommit ? latestMainCommit.commit : "",
+                  refs: "HEAD -> main",
+                };
+                
+                // Insert fake merge commit at the very top (index 0)
+                commitsForTree.unshift(fakeMergeCommitForTree);
+              }
+              
+              // Remove "main" badge from all other commits (but keep it on fake merge or moved feature-branch commits)
+              // Only modify refs when feature-branch commits are moved (shouldMoveFeatureBranchCommits is true)
+              if (showFakeMergeCommit) {
+                commitsForTree = commitsForTree.map((c, index) => {
+                  const isFakeMerge = c.commit === "merge-commit-abc123";
+                  const is09af298 = c.commit.includes('09af298');
+                  const is3ad0351 = c.commit.includes('3ad0351');
+                  const isFeatureBranchCommit = is09af298 || is3ad0351;
+                  
+                  // Keep main badge on fake merge commit (index 0)
+                  if (isFakeMerge && index === 0) {
+                    // Keep main badge on fake merge commit
+                    return c;
+                  }
+                  
+                  // If feature-branch commits are not moved, keep their original refs
+                  if (isFeatureBranchCommit && !shouldMoveFeatureBranchCommits) {
+                    return c;
+                  }
+                  
+                  // Only modify feature-branch commits when they are moved
+                  if (isFeatureBranchCommit && shouldMoveFeatureBranchCommits) {
+                    const effectiveIndex = isMergeFromReady ? index - 1 : index;
+                    if (is09af298 && effectiveIndex === 0) {
+                      // Keep main badge on 09af298 at effective index 0
+                      return c;
+                    }
+                    
+                    if (is3ad0351) {
+                      // Remove main badge from 3ad0351 (it's not the top commit)
+                      const refsList = c.refs ? c.refs.split(',').map(r => r.trim()).filter(r => r) : [];
+                      const updatedRefsList = refsList.filter(r => !r.includes('main') && !r.includes('HEAD -> main'));
+                      return {
+                        ...c,
+                        refs: updatedRefsList.join(', ') || "",
+                      };
+                    }
+                  }
+                  
+                  // Remove main badge from all other commits (except fake merge and moved feature-branch commits)
+                  if (!isFakeMerge && !(isFeatureBranchCommit && shouldMoveFeatureBranchCommits)) {
+                    const refsList = c.refs ? c.refs.split(',').map(r => r.trim()).filter(r => r) : [];
+                    const updatedRefsList = refsList.filter(r => !r.includes('main') && !r.includes('HEAD -> main'));
+                    return {
+                      ...c,
+                      refs: updatedRefsList.join(', ') || "",
+                    };
+                  }
+                  
+                  return c;
                 });
               }
               
@@ -507,24 +666,89 @@ export function GitWindow(props: GitWindowProps = {}) {
               console.log('commitsForTree after filtering:', commitsForTree.length, commitsForTree.map(c => c.commit.substring(0, 7)));
               console.log('3ad0351 in commitsForTree?', commitsForTree.some(c => c.commit.includes('3ad0351')));
               
-              // Remove commit 876369a when reset effect is shown
-              // Note: We only remove 876369a, feature-branch commits should still be visible
+              // Update parent references and refs when reset effect is shown (commits already removed from commitsForTree)
               if (showResetEffect) {
-                const commitToRemove = paginatedCommits.find(pc => pc.abbreviated_commit === "876369a");
-                if (commitToRemove) {
-                  commitsForTree = commitsForTree.filter(c => c.commit !== commitToRemove.commit);
-                  // Update parent references: if any commit has 876369a as a parent, update it to point to 876369a's parent
-                  const removedCommitHash = commitToRemove.commit;
-                  const removedCommitParent = commitToRemove.parent.split(' ').filter(p => p.trim())[0]; // First parent
-                  commitsForTree = commitsForTree.map(c => {
-                    // If this commit's parent is the removed commit, update it to point to the removed commit's parent
+                const commitsToRemove = paginatedCommits.filter(pc => 
+                  pc.abbreviated_commit === "876369a" || pc.abbreviated_commit === "48975f5"
+                );
+                
+                if (commitsToRemove.length > 0) {
+                  const removedCommitHashes = new Set(commitsToRemove.map(c => c.commit));
+                  
+                  // Build a map of removed commit -> its parent for parent reference updates
+                  const removedCommitToParent = new Map<string, string>();
+                  commitsToRemove.forEach(commitToRemove => {
+                    const removedCommitHash = commitToRemove.commit;
+                    const removedCommitParent = commitToRemove.parent.split(' ').filter(p => p.trim())[0]; // First parent
+                    if (removedCommitParent) {
+                      removedCommitToParent.set(removedCommitHash, removedCommitParent);
+                    }
+                  });
+                  
+                  // Find ba78722 commit hash for ref update
+                  const ba78722Commit = commitsToRenderForMapping.find(c2 => c2.abbreviated_commit === 'ba78722');
+                  const ba78722CommitHash = ba78722Commit?.commit;
+                  
+                  // Update parent references and refs: if any commit has a removed commit as a parent, 
+                  // update it to point to the removed commit's parent
+                  // Also add "main" ref to ba78722 only if it's the top commit of the main line
+                  commitsForTree = commitsForTree.map((c, index) => {
                     const parents = c.parent.split(' ').filter(p => p.trim());
-                    if (parents.includes(removedCommitHash)) {
-                      // Replace the removed commit with its parent
-                      const updatedParents = parents.map(p => p === removedCommitHash ? removedCommitParent : p).filter(p => p);
+                    let updatedParents = [...parents];
+                    let hasChanges = false;
+                    let updatedRefs = c.refs;
+                    
+                    // Update parent references
+                    parents.forEach(parentHash => {
+                      if (removedCommitHashes.has(parentHash)) {
+                        // This parent was removed, replace it with the removed commit's parent
+                        const replacementParent = removedCommitToParent.get(parentHash);
+                        if (replacementParent) {
+                          const index = updatedParents.indexOf(parentHash);
+                          if (index !== -1) {
+                            updatedParents[index] = replacementParent;
+                            hasChanges = true;
+                          }
+                        } else {
+                          // No replacement parent, remove this parent reference
+                          updatedParents = updatedParents.filter(p => p !== parentHash);
+                          hasChanges = true;
+                        }
+                      }
+                    });
+                    
+                    // Update refs: add "main" to ba78722 only if it's the top commit of the main line
+                    // (but not when fake merge is shown)
+                    if (showResetEffect && !showFakeMergeCommit) {
+                      const isBa78722 = ba78722CommitHash && c.commit === ba78722CommitHash;
+                      if (isBa78722) {
+                        // Check if ba78722 is the top commit (index 0) or the first commit with main potential
+                        const isTopMainCommit = index === 0 || commitsForTree.slice(0, index).every(c2 => {
+                          const refs = parseBranchRefs(c2.refs, hideRemoteBranches);
+                          return !refs.includes("main");
+                        });
+                        
+                        if (isTopMainCommit) {
+                          const currentBranchRefs = parseBranchRefs(updatedRefs, hideRemoteBranches);
+                          if (!currentBranchRefs.includes("main")) {
+                            // Add "main" ref to ba78722 only if it's the top commit
+                            const refsList = updatedRefs ? updatedRefs.split(',').map(r => r.trim()).filter(r => r) : [];
+                            if (!refsList.some(r => r.includes('main') || r.includes('HEAD -> main'))) {
+                              refsList.push('HEAD -> main');
+                              updatedRefs = refsList.join(', ');
+                              hasChanges = true;
+                              console.log(`GitWindow: Added main ref to ba78722 (top commit): ${updatedRefs}`);
+                            }
+                          }
+                        }
+                      }
+                    }
+                    
+                    if (hasChanges) {
                       return {
                         ...c,
-                        parent: updatedParents.join(' '),
+                        parent: updatedParents.filter(p => p).join(' '),
+                        refs: updatedRefs,
                       };
                     }
                     return c;
@@ -542,30 +766,126 @@ export function GitWindow(props: GitWindowProps = {}) {
                 return null;
               }
               
-              // Adjust row positions if we filtered commits
-              let treeRowPositions = rowPositions;
-              if ((showFakeMergeCommit || showResetEffect) && commitsForTree.length !== paginatedCommits.length) {
-                // Recalculate positions for filtered commits
-                const filteredIndices: number[] = [];
-                paginatedCommits.forEach((c, idx) => {
-                  if (showFakeMergeCommit) {
-                    const branchRefs = parseBranchRefs(c.refs, hideRemoteBranches);
-                    if (branchRefs.includes("feature-branch")) {
-                      return; // Skip feature-branch commits
+              // Calculate treeRowPositions to match commitsForTree
+              // Build the actual commitsToRender that matches what's rendered in the table
+              const actualCommitsToRender = (() => {
+                const commits = [...paginatedCommits];
+                
+                // Remove commits 876369a and 48975f5 when reset effect is shown
+                if (showResetEffect) {
+                  const indicesToRemove: number[] = [];
+                  commits.forEach((c, idx) => {
+                    if (c.abbreviated_commit === "876369a" || c.abbreviated_commit === "48975f5") {
+                      indicesToRemove.push(idx);
                     }
-                  }
-                  if (showResetEffect && c.abbreviated_commit === "876369a") {
-                    return; // Skip 876369a commit
-                  }
-                  filteredIndices.push(idx);
+                  });
+                  indicesToRemove.sort((a, b) => b - a).forEach(idx => {
+                    commits.splice(idx, 1);
+                  });
+                }
+                
+                // When fake merge is shown, conditionally move feature-branch commits (09af298 and 3ad0351) to the top
+                // Only move them when merging from DiffDialog (late action with checkbox), not for "ready" action
+                if (showFakeMergeCommit && shouldMoveFeatureBranchCommits) {
+                  // Find and extract feature-branch commits
+                  const featureBranchCommits: GitCommit[] = [];
+                  const featureBranchIndicesToRemove: number[] = [];
+                  
+                  commits.forEach((c, idx) => {
+                    if (c.abbreviated_commit === "09af298" || c.abbreviated_commit === "3ad0351") {
+                      featureBranchCommits.push(c);
+                      featureBranchIndicesToRemove.push(idx);
+                    }
+                  });
+                  
+                  // Remove from original positions (from highest index to lowest)
+                  featureBranchIndicesToRemove.sort((a, b) => b - a).forEach(idx => {
+                    commits.splice(idx, 1);
+                  });
+                  
+                  // Insert feature-branch commits at the top, maintaining order (09af298 first, then 3ad0351)
+                  // Reverse to maintain chronological order (newest first)
+                  featureBranchCommits.reverse().forEach(commit => {
+                    commits.unshift(commit);
+                  });
+                }
+                
+                // If this is from merge action (ready or late with checkbox), add fake merge commit at the very top
+                if (showFakeMergeCommit && isMergeFromReady) {
+                  console.log('Adding fake merge commit to actualCommitsToRender');
+                  // Find the latest main branch commit for the fake merge parent
+                  // Look in original paginatedCommits to find the true latest main commit
+                  const latestMainCommit = paginatedCommits.find(c => {
+                    const branchRefs = parseBranchRefs(c.refs, hideRemoteBranches);
+                    return branchRefs.includes("main");
+                  }) || paginatedCommits.find(c => c.abbreviated_commit === "ba78722");
+                  
+                  // Create fake merge commit
+                  const fakeMergeCommit: GitCommit = {
+                    commit: "merge-commit-abc123",
+                    abbreviated_commit: "abc123",
+                    tree: "",
+                    abbreviated_tree: "",
+                    parent: latestMainCommit ? latestMainCommit.commit : "",
+                    abbreviated_parent: latestMainCommit ? latestMainCommit.abbreviated_commit : "",
+                    refs: "HEAD -> main",
+                    encoding: "",
+                    subject: "Merging feature-branch changes to main",
+                    sanitized_subject_line: "",
+                    body: "",
+                    commit_notes: "",
+                    verification_flag: "",
+                    signer: "",
+                    signer_key: "",
+                    author: {
+                      name: "Merge Bot",
+                      email: "merge@example.com",
+                      date: new Date().toISOString(),
+                    },
+                    commiter: {
+                      name: "Merge Bot",
+                      email: "merge@example.com",
+                      date: new Date().toISOString(),
+                    },
+                  };
+                  
+                  // Insert fake merge commit at the very top (index 0)
+                  commits.unshift(fakeMergeCommit);
+                }
+                
+                return commits;
+              })();
+              
+              let treeRowPositions: number[] = [];
+              
+              if (showFakeMergeCommit || showResetEffect) {
+                // Map commitsForTree to their row positions based on actualCommitsToRender order
+                // Build a map of commit hash to its index in actualCommitsToRender
+                const commitToIndex = new Map<string, number>();
+                actualCommitsToRender.forEach((c, idx) => {
+                  commitToIndex.set(c.commit, idx);
                 });
-                treeRowPositions = filteredIndices.map(idx => rowPositions[idx]);
+                
+                // Map commitsForTree to their row positions
+                commitsForTree.forEach(commit => {
+                  const idx = commitToIndex.get(commit.commit);
+                  if (idx !== undefined && idx < rowPositions.length) {
+                    treeRowPositions.push(rowPositions[idx]);
+                  }
+                });
+              } else {
+                // No filtering, use rowPositions directly (should match commitsForTree)
+                treeRowPositions = rowPositions.slice(0, commitsForTree.length);
               }
               
-              // Ensure rowPositions length matches commitsForTree length
+              // Ensure treeRowPositions length matches commitsForTree length
               if (treeRowPositions.length !== commitsForTree.length) {
-                // If lengths don't match, use the first N positions where N is commitsForTree.length
-                treeRowPositions = treeRowPositions.slice(0, commitsForTree.length);
+                // If we couldn't find all positions, use fallback calculation
+                console.warn(`Mismatch: treeRowPositions.length=${treeRowPositions.length}, commitsForTree.length=${commitsForTree.length}`);
+                // Recalculate using measuredHeaderHeight and estimated row heights
+                treeRowPositions = commitsForTree.map((_, idx) => {
+                  return measuredHeaderHeight + idx * 40 + 20; // Fallback: assume 40px per row
+                });
               }
               
               // Create a key that changes when commits are filtered to force re-render
@@ -614,19 +934,69 @@ export function GitWindow(props: GitWindowProps = {}) {
                 ) : (
                   (() => {
                     const commitsToRender = [...paginatedCommits];
-                    // Find index of commit 876369a and insert fake merge commit above it if needed
-                    const targetCommitIndex = commitsToRender.findIndex(c => c.abbreviated_commit === "876369a");
-                    if (showFakeMergeCommit && targetCommitIndex !== -1) {
+                    
+                    // Remove commits 876369a and 48975f5 when reset effect is shown
+                    if (showResetEffect) {
+                      // Remove in reverse order to maintain correct indices
+                      const indicesToRemove: number[] = [];
+                      commitsToRender.forEach((c, idx) => {
+                        if (c.abbreviated_commit === "876369a" || c.abbreviated_commit === "48975f5") {
+                          indicesToRemove.push(idx);
+                        }
+                      });
+                      // Remove from highest index to lowest to avoid index shifting issues
+                      indicesToRemove.sort((a, b) => b - a).forEach(idx => {
+                        commitsToRender.splice(idx, 1);
+                      });
+                    }
+                    
+                    // When fake merge is shown, conditionally move feature-branch commits (09af298 and 3ad0351) to the top
+                    // Only move them when merging from DiffDialog (late action with checkbox), not for "ready" action
+                    if (showFakeMergeCommit && shouldMoveFeatureBranchCommits) {
+                      // Find and extract feature-branch commits
+                      const featureBranchCommits: GitCommit[] = [];
+                      const featureBranchIndicesToRemove: number[] = [];
+                      
+                      commitsToRender.forEach((c, idx) => {
+                        if (c.abbreviated_commit === "09af298" || c.abbreviated_commit === "3ad0351") {
+                          featureBranchCommits.push(c);
+                          featureBranchIndicesToRemove.push(idx);
+                        }
+                      });
+                      
+                      // Remove from original positions (from highest index to lowest)
+                      featureBranchIndicesToRemove.sort((a, b) => b - a).forEach(idx => {
+                        commitsToRender.splice(idx, 1);
+                      });
+                      
+                      // Insert feature-branch commits at the top, maintaining order (09af298 first, then 3ad0351)
+                      // Reverse to maintain chronological order (newest first)
+                      featureBranchCommits.reverse().forEach(commit => {
+                        commitsToRender.unshift(commit);
+                      });
+                    }
+                    
+                    // If this is from merge action (ready or late with checkbox), add a fake merge commit at the very top
+                    if (showFakeMergeCommit && isMergeFromReady) {
+                      console.log('Adding fake merge commit to commitsToRender');
+                      // Find the latest main branch commit for the fake merge parent
+                      // Look in original paginatedCommits to find the true latest main commit
+                      const latestMainCommit = paginatedCommits.find(c => {
+                        const branchRefs = parseBranchRefs(c.refs, hideRemoteBranches);
+                        return branchRefs.includes("main");
+                      }) || paginatedCommits.find(c => c.abbreviated_commit === "ba78722");
+                      
+                      // Create fake merge commit
                       const fakeMergeCommit: GitCommit = {
-                        commit: "fake-merge-commit",
-                        abbreviated_commit: "abc1234",
+                        commit: "merge-commit-abc123",
+                        abbreviated_commit: "abc123",
                         tree: "",
                         abbreviated_tree: "",
-                        parent: "",
-                        abbreviated_parent: "",
+                        parent: latestMainCommit ? latestMainCommit.commit : "",
+                        abbreviated_parent: latestMainCommit ? latestMainCommit.abbreviated_commit : "",
                         refs: "HEAD -> main",
                         encoding: "",
-                        subject: "Merge: Resolved conflicts between feature-branch and main",
+                        subject: "Merging feature-branch changes to main",
                         sanitized_subject_line: "",
                         body: "",
                         commit_notes: "",
@@ -644,40 +1014,70 @@ export function GitWindow(props: GitWindowProps = {}) {
                           date: new Date().toISOString(),
                         },
                       };
-                      commitsToRender.splice(targetCommitIndex, 0, fakeMergeCommit);
+                      
+                      // Insert fake merge commit at the very top (index 0)
+                      commitsToRender.unshift(fakeMergeCommit);
                     }
                     
-                    // Remove commit 876369a when reset effect is shown
-                    if (showResetEffect) {
-                      const resetTargetIndex = commitsToRender.findIndex(c => c.abbreviated_commit === "876369a");
-                      if (resetTargetIndex !== -1) {
-                        commitsToRender.splice(resetTargetIndex, 1);
-                      }
-                    }
-                    
-                    return commitsToRender.map((commit) => {
-                      const isFakeMerge = commit.commit === "fake-merge-commit";
-                      const is876369a = commit.abbreviated_commit === "876369a";
+                    return commitsToRender.map((commit, index) => {
                       const isBa78722 = commit.abbreviated_commit === "ba78722";
+                      const is09af298 = commit.abbreviated_commit === "09af298";
+                      const is3ad0351 = commit.abbreviated_commit === "3ad0351";
+                      const isFakeMergeCommit = commit.commit === "merge-commit-abc123" || commit.abbreviated_commit === "abc123";
+                      const isFeatureBranchCommit = is09af298 || is3ad0351;
                       // Filter branch refs based on conditions
                       let branchRefs = parseBranchRefs(commit.refs, hideRemoteBranches);
+                      
                       if (showFakeMergeCommit) {
-                        // Remove feature-branch from all commits when fake merge is shown
-                        branchRefs = branchRefs.filter(branch => branch !== "feature-branch");
-                        // Remove "main" from 876369a only when fake merge commit is placed above it
-                        if (is876369a) {
+                        // If this is the fake merge commit, it should have main badge
+                        if (isFakeMergeCommit) {
+                          // Ensure fake merge commit has main badge
+                          if (!branchRefs.includes("main")) {
+                            branchRefs = [...branchRefs, "main"];
+                          }
+                        } else if (isFeatureBranchCommit && shouldMoveFeatureBranchCommits) {
+                          // Change feature-branch commits to blue (main) when they are moved to top
+                          // This applies to: "late" action (both ticked and unticked checkbox)
+                          // Remove feature-branch badge
+                          branchRefs = branchRefs.filter(branch => branch !== "feature-branch");
+                          // Only add main badge to 09af298 if it's the first non-fake-merge commit (index 1 if fake merge exists, index 0 otherwise)
+                          const effectiveIndex = isMergeFromReady ? index - 1 : index;
+                          if (effectiveIndex === 0 && is09af298) {
+                            if (!branchRefs.includes("main")) {
+                              branchRefs = [...branchRefs, "main"];
+                            }
+                          } else {
+                            // Remove main badge from other commits (like 3ad0351)
+                            branchRefs = branchRefs.filter(branch => branch !== "main");
+                          }
+                        } else {
+                          // Remove "main" badge from all other commits when fake merge is shown
+                          // (but keep feature-branch commits' original refs when not moved)
                           branchRefs = branchRefs.filter(branch => branch !== "main");
                         }
                       }
-                      // Add "main" badge to ba78722 when reset effect is shown
-                      if (showResetEffect && isBa78722 && !branchRefs.includes("main")) {
-                        branchRefs = [...branchRefs, "main"];
+                      
+                      // Add "main" badge to ba78722 when reset effect is shown (but not when fake merge is shown)
+                      // Only if ba78722 is the top commit of the main line
+                      if (showResetEffect && !showFakeMergeCommit && isBa78722 && !branchRefs.includes("main")) {
+                        // Check if ba78722 is the first commit with main ref or the first commit overall
+                        const isTopMainCommit = index === 0 || commitsToRender.slice(0, index).every(c => {
+                          const refs = parseBranchRefs(c.refs, hideRemoteBranches);
+                          return !refs.includes("main");
+                        });
+                        if (isTopMainCommit) {
+                          branchRefs = [...branchRefs, "main"];
+                        }
                       }
                       return (
                         <TableRow 
                           key={commit.commit} 
                           data-commit-row
-                          className={isFakeMerge ? "bg-blue-50 dark:bg-blue-950/20" : ""}
+                          className={
+                            showFakeMergeCommit && (isFakeMergeCommit || (isFeatureBranchCommit && shouldMoveFeatureBranchCommits))
+                              ? "bg-blue-50 dark:bg-blue-950/20" 
+                              : ""
+                          }
                         >
                           <TableCell className="p-0" style={{ height: '40px', width: '80px' }} />
                           <TableCell className="font-mono text-xs">
@@ -984,7 +1384,18 @@ export function GitWindow(props: GitWindowProps = {}) {
             // showResetEffect is already set, increment remount key to force re-render
             setTreeRemountKey(prev => prev + 1);
           } else {
-            // Directly show fake merge commit for regular rebase (checkbox unchecked)
+            // For "late" action with checkbox unticked: move commits but don't show fake merge
+            // For "ready" action: show fake merge commit (isMergeFromReady is true, shouldMoveFeatureBranchCommits is false)
+            // Set flags here since they may have been reset when drawer closed
+            if (lastActionType === "late") {
+              // This is "late" action with checkbox unticked - move commits to top
+              setShouldMoveFeatureBranchCommits(true);
+              setIsMergeFromReady(false);
+            } else if (lastActionType === "ready") {
+              // This is "ready" action - show fake merge commit, don't move commits
+              setIsMergeFromReady(true);
+              setShouldMoveFeatureBranchCommits(false);
+            }
             setMessageDialogOpen(false);
             setShowFakeMergeCommit(true);
           }
@@ -999,6 +1410,10 @@ export function GitWindow(props: GitWindowProps = {}) {
         open={diffDialogOpen}
         onOpenChange={setDiffDialogOpen}
         onMerge={() => {
+          // When merging from diff dialog (late action with checkbox), show fake merge commit at top
+          // Also move feature-branch commits to the top
+          setIsMergeFromReady(true);
+          setShouldMoveFeatureBranchCommits(true);
           setShowFakeMergeCommit(true);
         }}
       />

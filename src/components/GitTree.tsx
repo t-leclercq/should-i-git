@@ -44,6 +44,7 @@ const BRANCH_COLORS = [
 
 /**
  * Parse refs to extract branch names (local branches only)
+ * Handles remote branches by stripping "origin/" prefix and using local branch name
  */
 function parseBranchRefs(refs: string): string[] {
   if (!refs || !refs.trim()) {
@@ -56,19 +57,39 @@ function parseBranchRefs(refs: string): string[] {
     .filter(ref => ref.length > 0);
 
   const branches: string[] = [];
+  const seenLocalBranches = new Set<string>();
 
   for (const ref of refsList) {
     if (ref === 'HEAD' || ref.endsWith(' -> HEAD')) {
       continue;
     }
 
+    let branchName: string | null = null;
+
     if (ref.includes(' -> ')) {
-      const branchName = ref.split(' -> ')[1].trim();
-      if (branchName && branchName !== 'HEAD' && !branchName.includes('/')) {
-        branches.push(branchName);
+      branchName = ref.split(' -> ')[1].trim();
+      if (branchName === 'HEAD') {
+        continue;
       }
-    } else if (!ref.includes('/')) {
-      branches.push(ref);
+    } else {
+      branchName = ref;
+    }
+
+    if (!branchName) continue;
+
+    // Handle remote branches: strip "origin/" prefix
+    let localBranchName = branchName;
+    if (branchName.startsWith('origin/')) {
+      localBranchName = branchName.substring(7); // Remove "origin/" prefix
+    }
+
+    // Only add if it's a local branch (no remaining slashes) and we haven't seen the local name yet
+    // Prefer local branch over remote branch if both exist
+    if (!localBranchName.includes('/') && localBranchName !== 'HEAD') {
+      if (!seenLocalBranches.has(localBranchName)) {
+        branches.push(localBranchName);
+        seenLocalBranches.add(localBranchName);
+      }
     }
   }
 
@@ -107,6 +128,7 @@ function buildTreeStructure(
   });
 
   // Identify main branch (usually "main" or "master")
+  // IMPORTANT: Only look for "main" or "master", never use other branches as main
   let mainBranch: string | null = null;
   for (const commit of commits) {
     const branchRefs = parseBranchRefs(commit.refs);
@@ -119,18 +141,24 @@ function buildTreeStructure(
     }
   }
 
-  // If no main/master found, use the first branch or default to first commit's branch
-  if (!mainBranch && commits.length > 0) {
-    const firstRefs = parseBranchRefs(commits[0].refs);
-    mainBranch = firstRefs[0] || null;
-  }
+  // If no main/master found, don't default to another branch - leave it as null
+  // This ensures that only "main" or "master" are treated as main branch
+  // Other branches will be treated as feature branches
 
   // First, build a map of commits that are part of non-main branches
   // This includes both descendants (children) AND ancestors (parents) of branch tips
   // This helps us exclude commits that are part of feature branches even if they don't have branch refs
   const branchDescendants = new Set<string>();
   
-  // First pass: identify branch tips and trace forward (children)
+  // First pass: mark all commits that have non-main branch refs as branch descendants
+  commits.forEach(commit => {
+    const branchRefs = parseBranchRefs(commit.refs);
+    if (branchRefs.length > 0 && !branchRefs.includes(mainBranch || '') && !branchRefs.includes('master')) {
+      branchDescendants.add(commit.commit);
+    }
+  });
+  
+  // Second pass: trace forward from branch tips to mark descendants (children)
   commits.forEach(commit => {
     const branchRefs = parseBranchRefs(commit.refs);
     // If this commit has a non-main branch ref, trace forward to mark all descendants
@@ -138,7 +166,12 @@ function buildTreeStructure(
       const visited = new Set<string>();
       const queue: string[] = [commit.commit];
       visited.add(commit.commit);
-      branchDescendants.add(commit.commit);
+      
+      // Debug logging for feature-branch
+      const isFeatureBranch = branchRefs.includes('feature-branch');
+      if (isFeatureBranch) {
+        console.log(`GitTree: Tracing forward from ${commit.commit.substring(0, 7)} (feature-branch tip) to mark descendants`);
+      }
       
       // Trace forward to mark all descendants (children)
       while (queue.length > 0) {
@@ -150,18 +183,25 @@ function buildTreeStructure(
             visited.add(c.commit);
             queue.push(c.commit);
             branchDescendants.add(c.commit);
+            if (isFeatureBranch && c.commit.includes('3ad0351')) {
+              console.log(`GitTree: Marked ${c.commit.substring(0, 7)} as branch descendant (child of ${current.substring(0, 7)})`);
+            }
           }
         });
       }
     }
   });
   
-  // Second pass: trace backward from branch tips to mark ancestors
-  // Only mark commits on the direct path from branch tip to common ancestor
-  // We'll use a helper function similar to findCommonAncestor to identify when we hit main line
+  // Third pass: trace backward from branch tips to mark ancestors
+  // Also trace forward to find all commits on the branch path (handles broken parent chains after reset)
   commits.forEach(commit => {
     const branchRefs = parseBranchRefs(commit.refs);
     if (branchRefs.length > 0 && !branchRefs.includes(mainBranch || '') && !branchRefs.includes('master')) {
+      const isFeatureBranch = branchRefs.includes('feature-branch');
+      if (isFeatureBranch) {
+        console.log(`GitTree: Tracing backward from ${commit.commit.substring(0, 7)} (feature-branch tip) to mark ancestors`);
+      }
+      
       // Find the main tip to check ancestors
       const mainTip = commits.find(c => parseBranchRefs(c.refs).includes(mainBranch || ''));
       if (!mainTip) return;
@@ -203,14 +243,172 @@ function buildTreeStructure(
           if (!backwardVisited.has(parent) && nodes.has(parent)) {
             // Stop if parent is an ancestor of main tip (it's the common ancestor or on main line)
             if (mainLineAncestors.has(parent)) {
+              if (isFeatureBranch && parent.includes('165d919')) {
+                console.log(`GitTree: Stopped at common ancestor ${parent.substring(0, 7)}`);
+              }
               continue; // Stop here, this is the common ancestor
             }
             
             backwardVisited.add(parent);
             backwardQueue.push(parent);
             branchDescendants.add(parent);
+            if (isFeatureBranch && parent.includes('3ad0351')) {
+              console.log(`GitTree: Marked ${parent.substring(0, 7)} as branch descendant (ancestor of ${commit.commit.substring(0, 7)})`);
+            }
           }
         }
+      }
+      
+      // Additional pass: find all commits that are parents of already-marked branch descendants
+      // This handles cases where parent chain is broken after commit removal
+      // Also check if any commit in the list has a branch descendant as a child (reverse lookup)
+      let foundMore = true;
+      let iteration = 0;
+      while (foundMore && iteration < 10) { // Limit iterations to prevent infinite loops
+        foundMore = false;
+        iteration++;
+        
+        // Forward: find parents of branch descendants
+        commits.forEach(c => {
+          if (branchDescendants.has(c.commit)) {
+            const parents = c.parent.split(' ').filter(p => p.trim());
+            for (const parent of parents) {
+              if (nodes.has(parent) && !branchDescendants.has(parent) && !mainLineAncestors.has(parent)) {
+                branchDescendants.add(parent);
+                foundMore = true;
+                if (isFeatureBranch && parent.includes('3ad0351')) {
+                  console.log(`GitTree: [ADDITIONAL PASS] Marked ${parent.substring(0, 7)} as branch descendant (parent of ${c.commit.substring(0, 7)})`);
+                }
+              }
+            }
+          }
+        });
+        
+        // Reverse: find commits that have branch descendants as children
+        commits.forEach(c => {
+          if (!branchDescendants.has(c.commit) && !mainLineAncestors.has(c.commit)) {
+            const parents = c.parent.split(' ').filter(p => p.trim());
+            // Check if any of this commit's children are branch descendants
+            commits.forEach(child => {
+              const childParents = child.parent.split(' ').filter(p => p.trim());
+              if (childParents.includes(c.commit) && branchDescendants.has(child.commit)) {
+                branchDescendants.add(c.commit);
+                foundMore = true;
+                if (isFeatureBranch && c.commit.includes('3ad0351')) {
+                  console.log(`GitTree: [ADDITIONAL PASS REVERSE] Marked ${c.commit.substring(0, 7)} as branch descendant (has branch descendant child ${child.commit.substring(0, 7)})`);
+                }
+              }
+            });
+          }
+        });
+      }
+      
+      // Final pass: Find all commits that are ancestors of the branch tip
+      // This handles cases where the parent chain is completely broken after reset
+      // We check if commits are parents of commits that lead to branch tip (recursively)
+      if (isFeatureBranch) {
+        const branchTip = commit.commit;
+        
+        // Build a helper function to check if a commit leads to branch tip
+        const leadsToBranchTip = (commitHash: string): boolean => {
+          const visited = new Set<string>();
+          const queue: string[] = [commitHash];
+          visited.add(commitHash);
+          
+          while (queue.length > 0) {
+            const current = queue.shift()!;
+            if (current === branchTip) return true;
+            
+            // Find all commits that have current as a parent
+            commits.forEach(child => {
+              const childParents = child.parent.split(' ').filter(p => p.trim());
+              if (childParents.includes(current) && !visited.has(child.commit)) {
+                visited.add(child.commit);
+                queue.push(child.commit);
+              }
+            });
+          }
+          return false;
+        };
+        
+        // Build a set of commits that are on the path from branch tip to common ancestor
+        // This helps us identify commits that should be on the branch even if they're also ancestors of main
+        const branchPathCommits = new Set<string>();
+        const branchPathVisited = new Set<string>();
+        const branchPathQueue: string[] = [branchTip];
+        branchPathVisited.add(branchTip);
+        branchPathCommits.add(branchTip);
+        
+        // Trace backward from branch tip to find all commits on the branch path
+        while (branchPathQueue.length > 0) {
+          const current = branchPathQueue.shift()!;
+          const currentNode = nodes.get(current);
+          if (!currentNode) continue;
+          
+          const parents = currentNode.parent.split(' ').filter(p => p.trim());
+          for (const parent of parents) {
+            if (!branchPathVisited.has(parent) && nodes.has(parent)) {
+              // Stop if we hit a main line ancestor (common ancestor)
+              if (mainLineAncestors.has(parent)) {
+                continue; // Stop here, this is the common ancestor
+              }
+              branchPathVisited.add(parent);
+              branchPathQueue.push(parent);
+              branchPathCommits.add(parent);
+            }
+          }
+        }
+        
+        // Mark all commits on the branch path as branch descendants
+        branchPathCommits.forEach(commitHash => {
+          if (!branchDescendants.has(commitHash) && !mainLineAncestors.has(commitHash)) {
+            branchDescendants.add(commitHash);
+            if (commitHash.includes('3ad0351')) {
+              console.log(`GitTree: [FINAL PASS] Marked ${commitHash.substring(0, 7)} as branch descendant (on branch path from ${branchTip.substring(0, 7)})`);
+            }
+          }
+        });
+        
+        // Recursively find all ancestors: if a commit is a parent of a commit that leads to branch tip, it's also an ancestor
+        let foundMore = true;
+        let finalPassIteration = 0;
+        while (foundMore && finalPassIteration < 20) {
+          foundMore = false;
+          finalPassIteration++;
+          
+          commits.forEach(c => {
+            if (branchDescendants.has(c.commit) || mainLineAncestors.has(c.commit)) {
+              return; // Already processed
+            }
+            
+            // Check if this commit is a parent of ANY commit that leads to branch tip
+            let isAncestorOfBranchTip = false;
+            commits.forEach(child => {
+              const childParents = child.parent.split(' ').filter(p => p.trim());
+              if (childParents.includes(c.commit)) {
+                // Check if child leads to branch tip OR is already marked as branch descendant
+                if (branchDescendants.has(child.commit) || leadsToBranchTip(child.commit)) {
+                  isAncestorOfBranchTip = true;
+                }
+              }
+            });
+            
+            if (isAncestorOfBranchTip && !mainLineAncestors.has(c.commit)) {
+              branchDescendants.add(c.commit);
+              foundMore = true;
+              if (c.commit.includes('3ad0351')) {
+                console.log(`GitTree: [FINAL PASS] Marked ${c.commit.substring(0, 7)} as branch descendant (parent of commit leading to ${branchTip.substring(0, 7)}, iteration ${finalPassIteration})`);
+              }
+            }
+          });
+        }
+        
+        if (isFeatureBranch && finalPassIteration >= 20) {
+          console.warn(`GitTree: Final pass reached iteration limit (20)`);
+        }
+      }
+      if (isFeatureBranch && iteration >= 10) {
+        console.warn(`GitTree: Additional pass reached iteration limit (10)`);
       }
     }
   });
@@ -257,13 +455,25 @@ function buildTreeStructure(
       }
     }
   } else {
-    // No main branch found - mark all commits as main line
-    commits.forEach(c => mainLineCommits.add(c.commit));
+    // No main branch found - don't mark any commits as main line
+    // All commits will be treated as branch commits
+    // This is correct when there's no "main" or "master" branch
   }
 
   // Assign lanes to branch tips
-  commits.forEach((commit) => {
+  // IMPORTANT: Process commits in reverse order (newest first) to ensure branch tips are assigned first
+  const commitsReversed = [...commits].reverse();
+  commitsReversed.forEach((commit) => {
     const branchRefs = parseBranchRefs(commit.refs);
+    
+    // Debug logging for commits we care about
+    if (commit.commit.includes('09af298') || commit.commit.includes('3ad0351')) {
+      console.log(`GitTree: Processing commit ${commit.commit.substring(0, 7)} for lane assignment`, {
+        refs: commit.refs,
+        branchRefs,
+        mainBranch,
+      });
+    }
     
     if (branchRefs.length > 0) {
       const primaryBranch = branchRefs[0];
@@ -275,6 +485,9 @@ function buildTreeStructure(
         const node = nodes.get(commit.commit)!;
         node.lane = 0;
         node.isOnMainLine = true;
+        if (commit.commit.includes('09af298') || commit.commit.includes('3ad0351')) {
+          console.log(`GitTree: Assigned ${commit.commit.substring(0, 7)} to main (lane 0)`);
+        }
       } else {
         // Other branches get their own lanes
         if (!branchColors.has(primaryBranch)) {
@@ -284,6 +497,10 @@ function buildTreeStructure(
             color: BRANCH_COLORS[colorIndex],
             lane: nextLane++,
           });
+          console.log(`GitTree: Created branch color for ${primaryBranch}`, {
+            color: BRANCH_COLORS[colorIndex],
+            lane: nextLane - 1,
+          });
         }
         
         const branchColor = branchColors.get(primaryBranch)!;
@@ -292,6 +509,19 @@ function buildTreeStructure(
         const node = nodes.get(commit.commit)!;
         node.lane = branchColor.lane;
         node.isOnMainLine = false;
+        if (commit.commit.includes('09af298') || commit.commit.includes('3ad0351')) {
+          console.log(`GitTree: Assigned ${commit.commit.substring(0, 7)} to ${primaryBranch}`, {
+            lane: branchColor.lane,
+            color: branchColor.color,
+          });
+        }
+      }
+    } else {
+      if (commit.commit.includes('09af298') || commit.commit.includes('3ad0351')) {
+        console.warn(`GitTree: No branch refs found for ${commit.commit.substring(0, 7)}`, {
+          refs: commit.refs,
+          parsedBranchRefs: branchRefs,
+        });
       }
     }
   });
@@ -299,13 +529,38 @@ function buildTreeStructure(
   // Propagate lanes backwards through history
   commits.forEach((commit) => {
     const node = nodes.get(commit.commit)!;
+    const isTargetCommit = commit.commit.includes('3ad0351');
     
     if (commitToLane.has(commit.commit)) {
       return; // Already assigned
     }
 
-    // Check if on main line - but ONLY if it's not a branch descendant
-    if (mainLineCommits.has(commit.commit) && !branchDescendants.has(commit.commit)) {
+    // CRITICAL FIX: Check if branch descendant FIRST, before any main line checks
+    // This ensures branch descendants always get assigned to a branch lane
+    if (branchDescendants.has(commit.commit)) {
+      // Assign to first branch immediately if branch colors exist
+      if (branchColors.size > 0) {
+        const firstBranch = Array.from(branchColors.values())[0];
+        commitToLane.set(commit.commit, firstBranch.lane);
+        commitToBranch.set(commit.commit, firstBranch.branch);
+        node.lane = firstBranch.lane;
+        node.isOnMainLine = false;
+        if (isTargetCommit) {
+          console.log(`GitTree: [FIXED] Assigned ${commit.commit.substring(0, 7)} to branch lane ${firstBranch.lane} (${firstBranch.branch}) - branch descendant`);
+        }
+        return;
+      }
+      
+      // If no branch colors exist yet, this shouldn't happen, but handle it gracefully
+      // Don't assign to main line - leave it unassigned or assign later
+      if (isTargetCommit) {
+        console.error(`GitTree: ${commit.commit.substring(0, 7)} is a branch descendant but no branch colors exist! This should not happen.`);
+      }
+      return;
+    }
+
+    // Check if on main line - only for non-branch-descendants
+    if (mainLineCommits.has(commit.commit)) {
       commitToLane.set(commit.commit, 0);
       node.lane = 0;
       node.isOnMainLine = true;
@@ -313,7 +568,39 @@ function buildTreeStructure(
     }
 
     // If it's a branch descendant but not assigned yet, find branch assignment
+    // (This block should not be reached if the check above worked, but keeping for safety)
     if (branchDescendants.has(commit.commit)) {
+      // Assign to first branch immediately if branch colors exist
+      if (branchColors.size > 0) {
+        const firstBranch = Array.from(branchColors.values())[0];
+        commitToLane.set(commit.commit, firstBranch.lane);
+        commitToBranch.set(commit.commit, firstBranch.branch);
+        node.lane = firstBranch.lane;
+        node.isOnMainLine = false;
+        return;
+      }
+      
+      // First, check if this commit itself has a branch ref - if so, assign it to that branch's lane
+      const commitBranchRefs = parseBranchRefs(commit.refs);
+      if (commitBranchRefs.length > 0 && !commitBranchRefs.includes(mainBranch || '') && !commitBranchRefs.includes('master')) {
+        const branchName = commitBranchRefs[0];
+        // Find or create the branch color/lane
+        if (!branchColors.has(branchName)) {
+          const colorIndex = (branchColors.size % (BRANCH_COLORS.length - 1)) + 1;
+          branchColors.set(branchName, {
+            branch: branchName,
+            color: BRANCH_COLORS[colorIndex],
+            lane: nextLane++,
+          });
+        }
+        const branchColor = branchColors.get(branchName)!;
+        commitToLane.set(commit.commit, branchColor.lane);
+        commitToBranch.set(commit.commit, branchName);
+        node.lane = branchColor.lane;
+        node.isOnMainLine = false;
+        return;
+      }
+      
       // First, try tracing forward (to children) to find the branch tip
       // This handles cases where the commit is an ancestor of the branch tip
       const forwardVisited = new Set<string>();
@@ -322,9 +609,20 @@ function buildTreeStructure(
       let foundLane: number | null = null;
       let foundBranch: string | null = null;
 
+      if (isTargetCommit) {
+        console.log(`GitTree: Tracing forward from ${commit.commit.substring(0, 7)} to find branch tip`);
+      }
+
       // Trace forward to find commits with assigned lanes (branch tips)
       while (forwardQueue.length > 0 && foundLane === null) {
         const current = forwardQueue.shift()!;
+        
+        if (isTargetCommit) {
+          console.log(`GitTree: Checking ${current.substring(0, 7)} in forward trace`, {
+            hasLane: commitToLane.has(current),
+            lane: commitToLane.has(current) ? commitToLane.get(current) : null,
+          });
+        }
         
         if (commitToLane.has(current)) {
           const lane = commitToLane.get(current)!;
@@ -332,18 +630,29 @@ function buildTreeStructure(
             // Found a branch lane
             foundLane = lane;
             foundBranch = commitToBranch.get(current) || null;
+            if (isTargetCommit) {
+              console.log(`GitTree: Found branch lane ${foundLane} (${foundBranch}) for ${commit.commit.substring(0, 7)} via forward trace from ${current.substring(0, 7)}`);
+            }
             break;
           }
         }
 
         // Find children (commits that have current as a parent)
+        const children: string[] = [];
         commits.forEach(c => {
           const cParents = c.parent.split(' ').filter(p => p.trim());
           if (cParents.includes(current) && !forwardVisited.has(c.commit)) {
             forwardVisited.add(c.commit);
             forwardQueue.push(c.commit);
+            children.push(c.commit);
+            if (isTargetCommit) {
+              console.log(`GitTree: Adding ${c.commit.substring(0, 7)} to forward queue (child of ${current.substring(0, 7)})`);
+            }
           }
         });
+        if (isTargetCommit && children.length === 0 && forwardQueue.length === 0) {
+          console.warn(`GitTree: Forward trace from ${commit.commit.substring(0, 7)} found no children and queue is empty`);
+        }
       }
 
       // If not found forward, try tracing backward (to parents)
@@ -386,9 +695,41 @@ function buildTreeStructure(
         node.isOnMainLine = false;
         return;
       }
+      
+      // If still not found, assign to the first non-main branch we find
+      // This is a safe fallback for branch descendants
+      if (branchColors.size > 0) {
+        const firstBranch = Array.from(branchColors.values())[0];
+        commitToLane.set(commit.commit, firstBranch.lane);
+        commitToBranch.set(commit.commit, firstBranch.branch);
+        node.lane = firstBranch.lane;
+        node.isOnMainLine = false;
+        if (isTargetCommit) {
+          console.log(`GitTree: Assigned ${commit.commit.substring(0, 7)} to first branch lane ${firstBranch.lane} (${firstBranch.branch}) as fallback`);
+        }
+        return;
+      } else {
+        if (isTargetCommit) {
+          console.error(`GitTree: ${commit.commit.substring(0, 7)} is a branch descendant but no branch colors exist! This should not happen.`);
+        }
+        // CRITICAL: Still return here to prevent falling through to Trace back section
+        // Even if no branch colors exist, we don't want to assign branch descendants to main line
+        return;
+      }
     }
 
     // Trace back to find branch assignment (for commits not in branchDescendants)
+    // IMPORTANT: This should NOT run for branch descendants - they should have returned above
+    if (branchDescendants.has(commit.commit)) {
+      if (isTargetCommit) {
+        console.error(`GitTree: [ERROR] ${commit.commit.substring(0, 7)} is a branch descendant but reached Trace back section! This should not happen.`);
+      }
+      return; // Don't process branch descendants in Trace back section
+    }
+    
+    if (isTargetCommit) {
+      console.log(`GitTree: [TRACE BACK] Processing ${commit.commit.substring(0, 7)} in Trace back section (NOT a branch descendant)`);
+    }
     const visited = new Set<string>();
     const queue: string[] = [commit.commit];
     visited.add(commit.commit);
@@ -422,11 +763,17 @@ function buildTreeStructure(
         commitToBranch.set(commit.commit, foundBranch);
       }
       node.isOnMainLine = foundLane === 0;
+      if (isTargetCommit) {
+        console.log(`GitTree: [TRACE BACK] Assigned ${commit.commit.substring(0, 7)} to lane ${foundLane} (isMainLine: ${node.isOnMainLine})`);
+      }
     } else {
       // Default to main line
       commitToLane.set(commit.commit, 0);
       node.lane = 0;
       node.isOnMainLine = true;
+      if (isTargetCommit) {
+        console.warn(`GitTree: [TRACE BACK] Defaulted ${commit.commit.substring(0, 7)} to main line (lane 0)`);
+      }
     }
   });
 
@@ -933,11 +1280,21 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
         
         if (node && !node.isOnMainLine && node.lane > 0) {
           // Find color by lane for branch commits
-          for (const [, branchColor] of branchColors.entries()) {
+          let foundColor = false;
+          for (const [branchName, branchColor] of branchColors.entries()) {
             if (branchColor.lane === node.lane) {
               color = branchColor.color;
+              foundColor = true;
+              if (isTargetCommit) {
+                console.log(`GitTree: Found color for 3ad0351 by lane ${node.lane}:`, { branchName, color: branchColor.color, lane: branchColor.lane });
+              }
               break;
             }
+          }
+          if (!foundColor && isTargetCommit) {
+            console.warn(`GitTree: No color found for 3ad0351 lane ${node.lane}. Available branchColors:`, 
+              Array.from(branchColors.entries()).map(([name, bc]) => ({ name, lane: bc.lane, color: bc.color }))
+            );
           }
         } else if (branchRefs.length > 0) {
           // Fallback: use branch refs if available
@@ -955,6 +1312,7 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
             nodeIsOnMainLine: node?.isOnMainLine,
             calculatedLane: node?.lane ?? 0,
             calculatedIsOnMainLine: node?.isOnMainLine ?? true,
+            branchColorsEntries: Array.from(branchColors.entries()).map(([name, bc]) => ({ name, lane: bc.lane, color: bc.color })),
           });
         }
 
