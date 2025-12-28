@@ -309,6 +309,35 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
     return { commit: commit.commit, x, y, lane, index, isOnMainLine };
   });
 
+  // Helper function to find common ancestor (where branch diverged from main)
+  const findCommonAncestor = (commitHash: string, mainLineCommits: Set<string>): string | null => {
+    const visited = new Set<string>();
+    const queue: string[] = [commitHash];
+    visited.add(commitHash);
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      
+      // If this commit is on main line, it's the common ancestor
+      if (mainLineCommits.has(current)) {
+        return current;
+      }
+
+      const node = nodes.get(current);
+      if (!node) continue;
+
+      const parents = node.parent.split(' ').filter(p => p.trim());
+      for (const parent of parents) {
+        if (!visited.has(parent) && nodes.has(parent)) {
+          visited.add(parent);
+          queue.push(parent);
+        }
+      }
+    }
+
+    return null;
+  };
+
   // Build paths for connections
   const paths: Array<{
     from: { x: number; y: number; lane: number; index: number; isOnMainLine: boolean };
@@ -317,6 +346,7 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
     color: string;
   }> = [];
 
+  // First, draw all parent-child connections for main line and within branches
   commits.forEach((commit, index) => {
     const node = nodes.get(commit.commit);
     if (!node) return;
@@ -331,36 +361,130 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
       const parentPos = commitPositions[parentIndex];
       const parentNode = nodes.get(parentHash);
       
-      // Determine branch color
-      let branch = node.branchRefs[0] || (parentNode?.branchRefs[0] ?? '');
-      if (!branch) {
-        const lane = node.lane;
-        for (const [branchName, branchColor] of branchColors.entries()) {
-          if (branchColor.lane === lane) {
-            branch = branchName;
-            break;
+      // Only draw direct parent connections if both are on the same lane
+      // (main line to main line, or same branch to same branch)
+      if (node.lane === parentNode?.lane && node.isOnMainLine === parentNode.isOnMainLine) {
+        // Determine branch color
+        let branch = node.branchRefs[0] || (parentNode?.branchRefs[0] ?? '');
+        if (!branch) {
+          const lane = node.lane;
+          for (const [branchName, branchColor] of branchColors.entries()) {
+            if (branchColor.lane === lane) {
+              branch = branchName;
+              break;
+            }
           }
         }
+
+        const branchColor = branchColors.get(branch);
+        const color = branchColor?.color || '#3b82f6'; // Default to blue for main
+
+        paths.push({
+          from: currentPos,
+          to: parentPos,
+          branch,
+          color,
+        });
       }
-
-      const branchColor = branchColors.get(branch);
-      const color = branchColor?.color || '#3b82f6'; // Default to blue for main
-
-      paths.push({
-        from: currentPos,
-        to: parentPos,
-        branch,
-        color,
-      });
     });
+  });
+
+  // Now, draw branch divergence lines (from common ancestor to branch tip)
+  const processedBranches = new Set<string>();
+  commits.forEach((commit) => {
+    const node = nodes.get(commit.commit);
+    if (!node || node.isOnMainLine) return; // Skip main line commits
+
+    const branchRefs = node.branchRefs;
+    if (branchRefs.length === 0) return;
+
+    const branchName = branchRefs[0];
+    if (processedBranches.has(branchName)) return; // Already processed this branch
+
+    // Find the tip of this branch (the commit with this branch ref that's highest in the list)
+    let branchTipIndex = -1;
+    let branchTipCommit: typeof commits[0] | null = null;
+    for (let i = 0; i < commits.length; i++) {
+      const c = commits[i];
+      const cNode = nodes.get(c.commit);
+      if (cNode && parseBranchRefs(c.refs).includes(branchName)) {
+        branchTipIndex = i;
+        branchTipCommit = c;
+        break; // Found the tip (newest commit with this branch)
+      }
+    }
+
+    if (!branchTipCommit || branchTipIndex === -1) return;
+
+    // Find common ancestor (where branch diverged from main)
+    const commonAncestorHash = findCommonAncestor(branchTipCommit.commit, treeData.mainLineCommits);
+    if (!commonAncestorHash) return;
+
+    const commonAncestorIndex = commits.findIndex(c => c.commit === commonAncestorHash);
+    if (commonAncestorIndex === -1) return;
+
+    const branchTipPos = commitPositions[branchTipIndex];
+    const commonAncestorPos = commitPositions[commonAncestorIndex];
+
+    // Get branch color
+    const branchColor = branchColors.get(branchName);
+    const color = branchColor?.color || '#3b82f6';
+
+    // Draw branch line from common ancestor to branch tip
+    paths.push({
+      from: commonAncestorPos,
+      to: branchTipPos,
+      branch: branchName,
+      color,
+    });
+
+    // Check if branch merges back into main
+    // Find merge commit: a commit on main line that has the branch tip as a parent
+    const branchTipHash = branchTipCommit.commit;
+    for (let i = 0; i < commits.length; i++) {
+      const mergeCommit = commits[i];
+      const mergeNode = nodes.get(mergeCommit.commit);
+      if (!mergeNode || !mergeNode.isOnMainLine) continue;
+
+      const parents = mergeCommit.parent.split(' ').filter(p => p.trim());
+      if (parents.includes(branchTipHash)) {
+        // Found merge commit - draw path from branch tip to merge commit
+        const mergePos = commitPositions[i];
+        paths.push({
+          from: branchTipPos,
+          to: mergePos,
+          branch: branchName,
+          color,
+        });
+        break;
+      }
+    }
+
+    processedBranches.add(branchName);
   });
 
   // Use the measured total height
   const svgHeight = totalHeight;
 
-  // Get first and last row Y positions for main line
-  const firstRowY = rowPositions[0] ?? (headerHeight + 20);
-  const lastRowY = rowPositions[rowPositions.length - 1] ?? (headerHeight + (totalRows - 1) * 40 + 20);
+  // Find first and last main line commits (not just first/last row)
+  let firstMainLineY: number | null = null;
+  let lastMainLineY: number | null = null;
+  
+  commitPositions.forEach((pos) => {
+    const node = nodes.get(pos.commit);
+    if (node && node.isOnMainLine) {
+      if (firstMainLineY === null || pos.y < firstMainLineY) {
+        firstMainLineY = pos.y;
+      }
+      if (lastMainLineY === null || pos.y > lastMainLineY) {
+        lastMainLineY = pos.y;
+      }
+    }
+  });
+
+  // Fallback to first/last row if no main line commits found
+  const firstRowY = firstMainLineY ?? (rowPositions[0] ?? (headerHeight + 20));
+  const lastRowY = lastMainLineY ?? (rowPositions[rowPositions.length - 1] ?? (headerHeight + (totalRows - 1) * 40 + 20));
 
   return (
     <svg
@@ -370,8 +494,8 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
       style={{ display: 'block' }}
       className="absolute top-0 left-0"
     >
-      {/* Draw main vertical line */}
-      {commits.length > 1 && (
+      {/* Draw main vertical line - only between main line commits */}
+      {commits.length > 1 && firstMainLineY !== null && lastMainLineY !== null && (
         <line
           x1={mainLineX}
           y1={firstRowY}
@@ -389,21 +513,22 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
         const isDivergence = from.lane !== to.lane || from.isOnMainLine !== to.isOnMainLine;
         
         if (isDivergence) {
-          // Rounded 90° corner: horizontal from source dot, then vertical to bottom of target dot
+          // Rounded 90° corner: horizontal from source dot, then vertical to target dot
           const cornerRadius = 8;
           
           // Determine direction
           const goingRight = to.x > from.x;
           const goingDown = to.y > from.y; // Parent is below (larger Y)
           
-          // Target Y: bottom of the target dot
-          // If going down, target is below, so add dotRadius
-          // If going up, target is above, so subtract dotRadius
-          const targetY = goingDown ? to.y + dotRadius : to.y - dotRadius;
+          // Start Y: center of the source dot (line starts AT the dot)
+          const startY = from.y;
+          
+          // Target Y: always end at the bottom of the target dot
+          // Bottom of dot = center + radius = to.y + dotRadius
+          const targetY = to.y + dotRadius;
           
           // Corner point: where horizontal and vertical lines meet
           const cornerX = to.x;
-          const cornerY = from.y;
           
           // Calculate points for the rounded corner
           // Horizontal line ends just before the corner
@@ -412,9 +537,21 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
             : cornerX + cornerRadius;
           
           // Vertical line starts just after the corner
+          // When going down: start below the horizontal line
+          // When going up: start at the top edge of the source dot (so line doesn't show above)
           const verticalStartY = goingDown 
-            ? cornerY + cornerRadius 
-            : cornerY - cornerRadius;
+            ? startY + cornerRadius 
+            : startY - dotRadius; // Top edge of source dot, not above it
+          
+          // For upward paths, use smaller corner radius to ensure arc doesn't extend above dot
+          const effectiveCornerRadius = goingDown ? cornerRadius : Math.min(cornerRadius, dotRadius);
+          
+          // Recalculate horizontal end for upward paths with smaller radius
+          const effectiveHorizontalEndX = goingDown 
+            ? horizontalEndX 
+            : (goingRight 
+              ? cornerX - effectiveCornerRadius 
+              : cornerX + effectiveCornerRadius);
           
           // Arc sweep flag for rounded 90° corner
           // Right-then-down: clockwise (1)
@@ -423,8 +560,8 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
           // Left-then-up: clockwise (1)
           const arcSweepFlag = (goingRight && goingDown) || (!goingRight && !goingDown) ? 1 : 0;
           
-          // Build the path: horizontal line -> rounded corner (arc) -> vertical line to bottom of dot
-          const pathData = `M ${from.x} ${from.y} L ${horizontalEndX} ${from.y} A ${cornerRadius} ${cornerRadius} 0 0 ${arcSweepFlag} ${cornerX} ${verticalStartY} L ${to.x} ${targetY}`;
+          // Build the path: horizontal line from dot center -> rounded corner (arc) -> vertical line to target
+          const pathData = `M ${from.x} ${startY} L ${effectiveHorizontalEndX} ${startY} A ${effectiveCornerRadius} ${effectiveCornerRadius} 0 0 ${arcSweepFlag} ${cornerX} ${verticalStartY} L ${to.x} ${targetY}`;
           
           return (
             <path
@@ -460,20 +597,21 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
         const node = nodes.get(commit.commit);
         const branchRefs = node?.branchRefs || [];
         
-        // Determine color
+        // Determine color based on lane assignment (not just branch refs)
         let color = '#3b82f6'; // Default blue for main
-        if (branchRefs.length > 0) {
-          const branchColor = branchColors.get(branchRefs[0]);
-          color = branchColor?.color || color;
-        } else if (node && !node.isOnMainLine) {
-          // Find color by lane
-          const lane = node.lane;
+        
+        if (node && !node.isOnMainLine && node.lane > 0) {
+          // Find color by lane for branch commits
           for (const [, branchColor] of branchColors.entries()) {
-            if (branchColor.lane === lane) {
+            if (branchColor.lane === node.lane) {
               color = branchColor.color;
               break;
             }
           }
+        } else if (branchRefs.length > 0) {
+          // Fallback: use branch refs if available
+          const branchColor = branchColors.get(branchRefs[0]);
+          color = branchColor?.color || color;
         }
 
         return (

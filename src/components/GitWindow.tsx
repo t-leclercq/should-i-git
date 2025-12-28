@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { createBranchColorMap } from "@/lib/branch-colors";
 import {
   Table,
   TableBody,
@@ -80,8 +81,10 @@ interface GitTag {
 /**
  * Parse refs string to extract branch names
  * Example: "HEAD -> main, origin/main, origin/HEAD" -> ["main", "origin/main"]
+ * @param refs - The refs string from git
+ * @param hideRemoteBranches - If true, filters out remote branches (origin/*) and prefers local branches when both exist
  */
-function parseBranchRefs(refs: string): string[] {
+function parseBranchRefs(refs: string, hideRemoteBranches: boolean = true): string[] {
   if (!refs || !refs.trim()) {
     return [];
   }
@@ -100,23 +103,41 @@ function parseBranchRefs(refs: string): string[] {
       continue;
     }
 
+    let branchName: string | null = null;
+
     // Handle "HEAD -> branch" format
     if (ref.includes(' -> ')) {
-      const branchName = ref.split(' -> ')[1].trim();
-      if (branchName && branchName !== 'HEAD') {
-        branches.push(branchName);
+      branchName = ref.split(' -> ')[1].trim();
+      if (branchName === 'HEAD') {
+        continue;
       }
     } else {
       // Regular branch reference
-      branches.push(ref);
+      branchName = ref;
     }
+
+    if (!branchName) continue;
+
+    // Skip remote branches if hideRemoteBranches is true
+    // This automatically prefers local branches when both exist
+    // (e.g., if both "main" and "origin/main" exist, only "main" is added)
+    if (hideRemoteBranches && branchName.startsWith('origin/')) {
+      continue;
+    }
+
+    branches.push(branchName);
   }
 
   // Remove duplicates and sort
   return [...new Set(branches)].sort();
 }
 
-export function GitWindow() {
+interface GitWindowProps {
+  hideRemoteBranches?: boolean;
+}
+
+export function GitWindow(props: GitWindowProps = {}) {
+  const { hideRemoteBranches = true } = props;
   const [activeTab, setActiveTab] = React.useState<"commits" | "branches" | "tags">("commits");
   const [commits, setCommits] = React.useState<GitCommit[]>([]);
   const [branches, setBranches] = React.useState<GitBranch[]>([]);
@@ -127,6 +148,11 @@ export function GitWindow() {
   const [measuredHeaderHeight, setMeasuredHeaderHeight] = React.useState<number>(40);
   const [rowPositions, setRowPositions] = React.useState<number[]>([]);
   const [totalTableHeight, setTotalTableHeight] = React.useState<number>(0);
+  
+  // Create branch color map from commits
+  const branchColorMap = React.useMemo(() => {
+    return createBranchColorMap(commits);
+  }, [commits]);
 
   // Measure table dimensions after render
   React.useEffect(() => {
@@ -293,7 +319,7 @@ export function GitWindow() {
                   </TableRow>
                 ) : (
                   commits.map((commit, index) => {
-                    const branchRefs = parseBranchRefs(commit.refs);
+                    const branchRefs = parseBranchRefs(commit.refs, hideRemoteBranches);
                     return (
                       <TableRow key={commit.commit} data-commit-row>
                         <TableCell className="p-0" style={{ height: '40px', width: '80px' }} />
@@ -302,15 +328,22 @@ export function GitWindow() {
                             <span>{commit.abbreviated_commit}</span>
                             {branchRefs.length > 0 && (
                               <div className="flex flex-wrap gap-1 mt-1">
-                                {branchRefs.map((branch) => (
-                                  <Badge
-                                    key={branch}
-                                    variant="outline"
-                                    className="text-[0.625rem] px-1.5 py-0"
-                                  >
-                                    {branch}
-                                  </Badge>
-                                ))}
+                                {branchRefs.map((branch) => {
+                                  const branchColor = branchColorMap.get(branch) || '#3b82f6';
+                                  return (
+                                    <Badge
+                                      key={branch}
+                                      variant="outline"
+                                      className="text-[0.625rem] px-1.5 py-0"
+                                      style={{
+                                        borderColor: branchColor,
+                                        color: branchColor,
+                                      }}
+                                    >
+                                      {branch}
+                                    </Badge>
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
