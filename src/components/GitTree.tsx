@@ -84,6 +84,7 @@ function buildTreeStructure(
   nodes: Map<string, CommitNode>;
   branchColors: Map<string, BranchColor>;
   mainLineCommits: Set<string>;
+  mainBranch: string | null;
 } {
   const nodes = new Map<string, CommitNode>();
   const branchColors = new Map<string, BranchColor>();
@@ -124,6 +125,96 @@ function buildTreeStructure(
     mainBranch = firstRefs[0] || null;
   }
 
+  // First, build a map of commits that are part of non-main branches
+  // This includes both descendants (children) AND ancestors (parents) of branch tips
+  // This helps us exclude commits that are part of feature branches even if they don't have branch refs
+  const branchDescendants = new Set<string>();
+  
+  // First pass: identify branch tips and trace forward (children)
+  commits.forEach(commit => {
+    const branchRefs = parseBranchRefs(commit.refs);
+    // If this commit has a non-main branch ref, trace forward to mark all descendants
+    if (branchRefs.length > 0 && !branchRefs.includes(mainBranch || '') && !branchRefs.includes('master')) {
+      const visited = new Set<string>();
+      const queue: string[] = [commit.commit];
+      visited.add(commit.commit);
+      branchDescendants.add(commit.commit);
+      
+      // Trace forward to mark all descendants (children)
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        // Find all commits that have current as a parent (children of current)
+        commits.forEach(c => {
+          const cParents = c.parent.split(' ').filter(p => p.trim());
+          if (cParents.includes(current) && !visited.has(c.commit)) {
+            visited.add(c.commit);
+            queue.push(c.commit);
+            branchDescendants.add(c.commit);
+          }
+        });
+      }
+    }
+  });
+  
+  // Second pass: trace backward from branch tips to mark ancestors
+  // Only mark commits on the direct path from branch tip to common ancestor
+  // We'll use a helper function similar to findCommonAncestor to identify when we hit main line
+  commits.forEach(commit => {
+    const branchRefs = parseBranchRefs(commit.refs);
+    if (branchRefs.length > 0 && !branchRefs.includes(mainBranch || '') && !branchRefs.includes('master')) {
+      // Find the main tip to check ancestors
+      const mainTip = commits.find(c => parseBranchRefs(c.refs).includes(mainBranch || ''));
+      if (!mainTip) return;
+      
+      // Build a set of main line ancestors (commits that are ancestors of main tip)
+      const mainLineAncestors = new Set<string>();
+      const mainVisited = new Set<string>();
+      const mainQueue: string[] = [mainTip.commit];
+      mainVisited.add(mainTip.commit);
+      mainLineAncestors.add(mainTip.commit);
+      
+      while (mainQueue.length > 0) {
+        const current = mainQueue.shift()!;
+        const currentNode = nodes.get(current);
+        if (!currentNode) continue;
+        
+        const parents = currentNode.parent.split(' ').filter(p => p.trim());
+        for (const parent of parents) {
+          if (!mainVisited.has(parent) && nodes.has(parent)) {
+            mainVisited.add(parent);
+            mainQueue.push(parent);
+            mainLineAncestors.add(parent);
+          }
+        }
+      }
+      
+      // Now trace backward from branch tip, stopping at common ancestor
+      const backwardVisited = new Set<string>();
+      const backwardQueue: string[] = [commit.commit];
+      backwardVisited.add(commit.commit);
+      
+      while (backwardQueue.length > 0) {
+        const current = backwardQueue.shift()!;
+        const currentNode = nodes.get(current);
+        if (!currentNode) continue;
+        
+        const parents = currentNode.parent.split(' ').filter(p => p.trim());
+        for (const parent of parents) {
+          if (!backwardVisited.has(parent) && nodes.has(parent)) {
+            // Stop if parent is an ancestor of main tip (it's the common ancestor or on main line)
+            if (mainLineAncestors.has(parent)) {
+              continue; // Stop here, this is the common ancestor
+            }
+            
+            backwardVisited.add(parent);
+            backwardQueue.push(parent);
+            branchDescendants.add(parent);
+          }
+        }
+      }
+    }
+  });
+
   // Mark main line commits - trace from main branch tip backwards
   if (mainBranch) {
     const mainTip = commits.find(c => parseBranchRefs(c.refs).includes(mainBranch!));
@@ -141,6 +232,23 @@ function buildTreeStructure(
         const parents = node.parent.split(' ').filter(p => p.trim());
         for (const parent of parents) {
           if (!visited.has(parent) && nodes.has(parent)) {
+            const parentNode = nodes.get(parent);
+            // Don't mark commits as main line if they belong to other branches (like feature-branch)
+            // Check if the parent commit has branch refs that are not main/master
+            if (parentNode) {
+              const parentBranchRefs = parentNode.branchRefs;
+              const hasNonMainBranch = parentBranchRefs.some(branch => branch !== mainBranch && branch !== 'master');
+              if (hasNonMainBranch) {
+                // This commit belongs to another branch, don't mark it as main line
+                continue;
+              }
+            }
+            
+            // Don't mark as main line if this commit is a descendant of a non-main branch
+            if (branchDescendants.has(parent)) {
+              continue;
+            }
+            
             visited.add(parent);
             queue.push(parent);
             mainLineCommits.add(parent);
@@ -196,15 +304,91 @@ function buildTreeStructure(
       return; // Already assigned
     }
 
-    // Check if on main line
-    if (mainLineCommits.has(commit.commit)) {
+    // Check if on main line - but ONLY if it's not a branch descendant
+    if (mainLineCommits.has(commit.commit) && !branchDescendants.has(commit.commit)) {
       commitToLane.set(commit.commit, 0);
       node.lane = 0;
       node.isOnMainLine = true;
       return;
     }
 
-    // Trace back to find branch assignment
+    // If it's a branch descendant but not assigned yet, find branch assignment
+    if (branchDescendants.has(commit.commit)) {
+      // First, try tracing forward (to children) to find the branch tip
+      // This handles cases where the commit is an ancestor of the branch tip
+      const forwardVisited = new Set<string>();
+      const forwardQueue: string[] = [commit.commit];
+      forwardVisited.add(commit.commit);
+      let foundLane: number | null = null;
+      let foundBranch: string | null = null;
+
+      // Trace forward to find commits with assigned lanes (branch tips)
+      while (forwardQueue.length > 0 && foundLane === null) {
+        const current = forwardQueue.shift()!;
+        
+        if (commitToLane.has(current)) {
+          const lane = commitToLane.get(current)!;
+          if (lane > 0) {
+            // Found a branch lane
+            foundLane = lane;
+            foundBranch = commitToBranch.get(current) || null;
+            break;
+          }
+        }
+
+        // Find children (commits that have current as a parent)
+        commits.forEach(c => {
+          const cParents = c.parent.split(' ').filter(p => p.trim());
+          if (cParents.includes(current) && !forwardVisited.has(c.commit)) {
+            forwardVisited.add(c.commit);
+            forwardQueue.push(c.commit);
+          }
+        });
+      }
+
+      // If not found forward, try tracing backward (to parents)
+      if (foundLane === null) {
+        const backwardVisited = new Set<string>();
+        const backwardQueue: string[] = [commit.commit];
+        backwardVisited.add(commit.commit);
+
+        while (backwardQueue.length > 0 && foundLane === null) {
+          const current = backwardQueue.shift()!;
+          const currentNode = nodes.get(current);
+          if (!currentNode) continue;
+
+          if (commitToLane.has(current)) {
+            const lane = commitToLane.get(current)!;
+            if (lane > 0) {
+              foundLane = lane;
+              foundBranch = commitToBranch.get(current) || null;
+              break;
+            }
+          }
+
+          const parents = currentNode.parent.split(' ').filter(p => p.trim());
+          for (const parent of parents) {
+            if (!backwardVisited.has(parent) && nodes.has(parent)) {
+              backwardVisited.add(parent);
+              backwardQueue.push(parent);
+            }
+          }
+        }
+      }
+
+      if (foundLane !== null && foundLane > 0) {
+        // Found a branch lane
+        commitToLane.set(commit.commit, foundLane);
+        node.lane = foundLane;
+        if (foundBranch) {
+          commitToBranch.set(commit.commit, foundBranch);
+        }
+        node.isOnMainLine = false;
+        return;
+      }
+    }
+
+    // Trace back to find branch assignment (for commits not in branchDescendants)
     const visited = new Set<string>();
     const queue: string[] = [commit.commit];
     visited.add(commit.commit);
@@ -262,7 +446,7 @@ function buildTreeStructure(
     }
   });
 
-  return { nodes, branchColors, mainLineCommits };
+  return { nodes, branchColors, mainLineCommits, mainBranch };
 }
 
 export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, totalHeight, width }: GitTreeProps) {
@@ -271,83 +455,150 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
     nodes: Map<string, CommitNode>;
     branchColors: Map<string, BranchColor>;
     mainLineCommits: Set<string>;
+    mainBranch: string | null;
   } | null>(null);
 
+  // Create a stable reference key for commits to detect changes
+  // Include commit hash, parent, and refs to catch all changes
+  const commitsKey = React.useMemo(() => {
+    return allCommits.map(c => `${c.commit}:${c.parent}:${c.refs}`).join('|');
+  }, [allCommits]);
+
+  // Force rebuild when commits change
   React.useEffect(() => {
     if (allCommits.length === 0) {
       setTreeData(null);
       return;
     }
 
+    // Force re-build tree structure when commits change
+    // Rebuild immediately without delay to ensure paths recalculate
     const data = buildTreeStructure(allCommits);
     setTreeData(data);
-  }, [allCommits]);
+  }, [commitsKey]); // commitsKey already includes all commit data, so it's sufficient
 
-  if (!treeData || allCommits.length === 0 || rowPositions.length === 0) {
-    return <div style={{ width, height: headerHeight + totalRows * 40 }} />;
-  }
-
-  const { nodes, branchColors } = treeData;
-  const commits = allCommits;
+  // Constants that don't depend on treeData
   const laneWidth = 16;
   const dotRadius = 3.5;
   const centerX = width / 2;
   const mainLineX = centerX;
 
   // Calculate positions for all commits using measured row positions
-  const commitPositions = commits.map((commit, index) => {
-    const node = nodes.get(commit.commit);
-    const lane = node?.lane ?? 0;
-    const isOnMainLine = node?.isOnMainLine ?? true;
+  // Always calculate positions for all commits, even if rowPositions is shorter
+  const commitPositions = React.useMemo(() => {
+    if (allCommits.length === 0) {
+      return [];
+    }
     
-    // Main line commits stay centered, branch commits offset
-    const x = isOnMainLine ? mainLineX : mainLineX + (lane > 0 ? laneWidth : -laneWidth) * lane;
+    // Always create positions for all commits, even if treeData is null
+    // This ensures dots are rendered even during tree structure rebuild
+    const nodes = treeData?.nodes || new Map();
     
-    // Use the measured Y position for this row (center of the row)
-    const y = rowPositions[index] ?? (headerHeight + index * 40 + 20);
-    
-    return { commit: commit.commit, x, y, lane, index, isOnMainLine };
-  });
-
-  // Helper function to find common ancestor (where branch diverged from main)
-  const findCommonAncestor = (commitHash: string, mainLineCommits: Set<string>): string | null => {
-    const visited = new Set<string>();
-    const queue: string[] = [commitHash];
-    visited.add(commitHash);
-
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      
-      // If this commit is on main line, it's the common ancestor
-      if (mainLineCommits.has(current)) {
-        return current;
+    return allCommits.map((commit, index) => {
+      // Ensure node exists - if not, create a default one
+      let node = nodes.get(commit.commit);
+      if (!node) {
+        // Node should always exist since buildTreeStructure creates nodes for all commits
+        // But if it doesn't, use defaults
+        const lane = 0;
+        const isOnMainLine = true;
+        const x = mainLineX;
+        const y = rowPositions[index] ?? (headerHeight + index * 40 + 20);
+        return { commit: commit.commit, x, y, lane, index, isOnMainLine };
       }
+      
+      const lane = node.lane ?? 0;
+      const isOnMainLine = node.isOnMainLine ?? true;
+      
+      // Main line commits stay centered, branch commits offset
+      const x = isOnMainLine ? mainLineX : mainLineX + (lane > 0 ? laneWidth : -laneWidth) * lane;
+      
+      // Use the measured Y position for this row (center of the row)
+      // If rowPositions doesn't have enough entries, calculate fallback position
+      const y = rowPositions[index] ?? (headerHeight + index * 40 + 20);
+      
+      return { commit: commit.commit, x, y, lane, index, isOnMainLine };
+    });
+  }, [allCommits, rowPositions, treeData, headerHeight, mainLineX, laneWidth]);
 
-      const node = nodes.get(current);
-      if (!node) continue;
+  // Build paths for connections - use useMemo to ensure recalculation when dependencies change
+  // Must be called before any conditional returns to follow Rules of Hooks
+  const paths = React.useMemo(() => {
+    if (!treeData || allCommits.length === 0 || commitPositions.length === 0) {
+      return [];
+    }
+    
+    const pathArray: Array<{
+      from: { x: number; y: number; lane: number; index: number; isOnMainLine: boolean };
+      to: { x: number; y: number; lane: number; index: number; isOnMainLine: boolean };
+      branch: string;
+      color: string;
+    }> = [];
+    
+    const { nodes, branchColors, mainLineCommits, mainBranch } = treeData;
+    const commits = allCommits;
 
-      const parents = node.parent.split(' ').filter(p => p.trim());
-      for (const parent of parents) {
-        if (!visited.has(parent) && nodes.has(parent)) {
-          visited.add(parent);
-          queue.push(parent);
+    // Helper function to find common ancestor (where branch diverged from main)
+    const findCommonAncestor = (commitHash: string, mainLineCommits: Set<string>): string | null => {
+      const visited = new Set<string>();
+      const queue: string[] = [commitHash];
+      visited.add(commitHash);
+
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        
+        // If this commit is on main line, it's the common ancestor
+        if (mainLineCommits.has(current)) {
+          return current;
+        }
+
+        // Try to get node from map first
+        let node = nodes.get(current);
+        
+        // If node not found, try to find it in commits array (handles updated parent references)
+        if (!node) {
+          const commitInArray = commits.find(c => c.commit === current);
+          if (commitInArray) {
+            // Create a temporary node-like structure from the commit
+            const parents = commitInArray.parent.split(' ').filter(p => p.trim());
+            for (const parent of parents) {
+              if (!visited.has(parent)) {
+                visited.add(parent);
+                // Check if parent is on main line
+                if (mainLineCommits.has(parent)) {
+                  return parent;
+                }
+                // Add to queue if it exists in commits
+                if (commits.some(c => c.commit === parent)) {
+                  queue.push(parent);
+                }
+              }
+            }
+          }
+          continue;
+        }
+
+        const parents = node.parent.split(' ').filter(p => p.trim());
+        for (const parent of parents) {
+          if (!visited.has(parent)) {
+            visited.add(parent);
+            // Check if parent is on main line first
+            if (mainLineCommits.has(parent)) {
+              return parent;
+            }
+            // Add to queue if parent exists in nodes OR in commits list
+            if (nodes.has(parent) || commits.some(c => c.commit === parent)) {
+              queue.push(parent);
+            }
+          }
         }
       }
-    }
 
-    return null;
-  };
+      return null;
+    };
 
-  // Build paths for connections
-  const paths: Array<{
-    from: { x: number; y: number; lane: number; index: number; isOnMainLine: boolean };
-    to: { x: number; y: number; lane: number; index: number; isOnMainLine: boolean };
-    branch: string;
-    color: string;
-  }> = [];
-
-  // First, draw all parent-child connections for main line and within branches
-  commits.forEach((commit, index) => {
+    // First, draw all parent-child connections for main line and within branches
+    commits.forEach((commit, index) => {
     const node = nodes.get(commit.commit);
     if (!node) return;
 
@@ -379,7 +630,7 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
         const branchColor = branchColors.get(branch);
         const color = branchColor?.color || '#3b82f6'; // Default to blue for main
 
-        paths.push({
+        pathArray.push({
           from: currentPos,
           to: parentPos,
           branch,
@@ -387,41 +638,55 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
         });
       }
     });
-  });
+    });
 
-  // Now, draw branch divergence lines (from common ancestor to branch tip)
-  const processedBranches = new Set<string>();
-  commits.forEach((commit) => {
-    const node = nodes.get(commit.commit);
-    if (!node || node.isOnMainLine) return; // Skip main line commits
-
-    const branchRefs = node.branchRefs;
-    if (branchRefs.length === 0) return;
-
-    const branchName = branchRefs[0];
-    if (processedBranches.has(branchName)) return; // Already processed this branch
-
-    // Find the tip of this branch (the commit with this branch ref that's highest in the list)
-    let branchTipIndex = -1;
-    let branchTipCommit: typeof commits[0] | null = null;
-    for (let i = 0; i < commits.length; i++) {
-      const c = commits[i];
-      const cNode = nodes.get(c.commit);
-      if (cNode && parseBranchRefs(c.refs).includes(branchName)) {
-        branchTipIndex = i;
-        branchTipCommit = c;
-        break; // Found the tip (newest commit with this branch)
+    // Now, draw branch divergence lines (from common ancestor to branch tip)
+    const processedBranches = new Set<string>();
+    
+    // First, find all branch tips (commits with branch refs)
+    // Commits are ordered newest first (index 0 is newest)
+    const branchTips = new Map<string, { commit: typeof commits[0]; index: number }>();
+    commits.forEach((commit, index) => {
+      const branchRefs = parseBranchRefs(commit.refs);
+      if (branchRefs.length > 0) {
+        const branchName = branchRefs[0];
+        // Keep the commit with the smallest index (newest commit) as the branch tip
+        if (!branchTips.has(branchName) || branchTips.get(branchName)!.index > index) {
+          branchTips.set(branchName, { commit, index });
+        }
       }
-    }
+    });
+    
+    // Process each branch
+    branchTips.forEach(({ commit: branchTipCommit, index: branchTipIndex }, branchName) => {
+      if (branchName === mainBranch || branchName === 'master') {
+        return; // Skip main branch
+      }
+      
+      if (processedBranches.has(branchName)) return; // Already processed
+      
+      const branchTipNode = nodes.get(branchTipCommit.commit);
+      if (!branchTipNode) {
+        processedBranches.add(branchName);
+        return;
+      }
+      
+      // Don't skip if on main line - we still want to draw the branch line
+      // The branch tip might be on main line if it's a merge commit
 
-    if (!branchTipCommit || branchTipIndex === -1) return;
+      // Find common ancestor (where branch diverged from main)
+      const commonAncestorHash = findCommonAncestor(branchTipCommit.commit, mainLineCommits);
+      if (!commonAncestorHash) {
+        // If no common ancestor found, skip this branch
+        processedBranches.add(branchName);
+        return;
+      }
 
-    // Find common ancestor (where branch diverged from main)
-    const commonAncestorHash = findCommonAncestor(branchTipCommit.commit, treeData.mainLineCommits);
-    if (!commonAncestorHash) return;
-
-    const commonAncestorIndex = commits.findIndex(c => c.commit === commonAncestorHash);
-    if (commonAncestorIndex === -1) return;
+      const commonAncestorIndex = commits.findIndex(c => c.commit === commonAncestorHash);
+      if (commonAncestorIndex === -1) {
+        processedBranches.add(branchName);
+        return;
+      }
 
     const branchTipPos = commitPositions[branchTipIndex];
     const commonAncestorPos = commitPositions[commonAncestorIndex];
@@ -431,7 +696,7 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
     const color = branchColor?.color || '#3b82f6';
 
     // Draw branch line from common ancestor to branch tip
-    paths.push({
+    pathArray.push({
       from: commonAncestorPos,
       to: branchTipPos,
       branch: branchName,
@@ -450,7 +715,7 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
       if (parents.includes(branchTipHash)) {
         // Found merge commit - draw path from branch tip to merge commit
         const mergePos = commitPositions[i];
-        paths.push({
+        pathArray.push({
           from: branchTipPos,
           to: mergePos,
           branch: branchName,
@@ -460,8 +725,18 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
       }
     }
 
-    processedBranches.add(branchName);
-  });
+      processedBranches.add(branchName);
+    });
+    
+    return pathArray;
+  }, [allCommits, commitPositions, treeData, commitsKey]); // Recalculate when these change
+
+  if (!treeData || allCommits.length === 0 || rowPositions.length === 0) {
+    return <div style={{ width, height: headerHeight + totalRows * 40 }} />;
+  }
+
+  const { nodes, branchColors, mainLineCommits, mainBranch } = treeData;
+  const commits = allCommits;
 
   // Use the measured total height
   const svgHeight = totalHeight;
@@ -591,11 +866,67 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
         }
       })}
 
-      {/* Draw commit dots */}
-      {commitPositions.map((pos, idx) => {
-        const commit = commits[idx];
+      {/* Draw commit dots - ensure we render a dot for EVERY commit in allCommits */}
+      {allCommits.map((commit, idx) => {
+        // Debug: check for 3ad0351
+        const isTargetCommit = commit.commit.includes('3ad0351');
+        if (isTargetCommit) {
+          console.log('GitTree: Rendering dot for 3ad0351', {
+            idx,
+            commit: commit.commit.substring(0, 7),
+            commitPositionsLength: commitPositions.length,
+            rowPositionsLength: rowPositions.length,
+          });
+        }
+        
+        // Always get node first to determine color and position
         const node = nodes.get(commit.commit);
         const branchRefs = node?.branchRefs || [];
+        
+        // Try to find position
+        let pos = commitPositions[idx];
+        if (!pos || pos.commit !== commit.commit) {
+          pos = commitPositions.find(p => p.commit === commit.commit);
+        }
+        
+        if (isTargetCommit) {
+          console.log('GitTree: Position for 3ad0351', {
+            posByIndex: commitPositions[idx],
+            posFound: pos,
+            node: node ? {
+              commit: node.commit.substring(0, 7),
+              lane: node.lane,
+              isOnMainLine: node.isOnMainLine,
+              branchRefs: node.branchRefs,
+            } : null,
+            branchRefs,
+            commitRefs: commit.refs,
+            allCommitsLength: allCommits.length,
+            commitIndex: idx,
+            treeDataExists: !!treeData,
+            nodesSize: nodes.size,
+            branchColors: Array.from(branchColors.entries()).map(([name, bc]) => ({ name, lane: bc.lane, color: bc.color })),
+          });
+        }
+        
+        // Calculate position - always ensure we have valid coordinates
+        let x: number;
+        let y: number;
+        
+        if (pos && !isNaN(pos.x) && !isNaN(pos.y)) {
+          x = pos.x;
+          y = pos.y;
+        } else {
+          // Fallback position calculation
+          const lane = node?.lane ?? 0;
+          const isOnMainLine = node?.isOnMainLine ?? true;
+          x = isOnMainLine ? mainLineX : mainLineX + (lane > 0 ? laneWidth : -laneWidth) * lane;
+          y = rowPositions[idx] ?? (headerHeight + idx * 40 + 20);
+          
+          if (isTargetCommit) {
+            console.log('GitTree: Using fallback position for 3ad0351', { x, y, lane, isOnMainLine });
+          }
+        }
         
         // Determine color based on lane assignment (not just branch refs)
         let color = '#3b82f6'; // Default blue for main
@@ -614,11 +945,25 @@ export function GitTree({ allCommits, totalRows, rowPositions, headerHeight, tot
           color = branchColor?.color || color;
         }
 
+        if (isTargetCommit) {
+          console.log('GitTree: Final dot props for 3ad0351', { 
+            x, 
+            y, 
+            color, 
+            dotRadius,
+            nodeLane: node?.lane,
+            nodeIsOnMainLine: node?.isOnMainLine,
+            calculatedLane: node?.lane ?? 0,
+            calculatedIsOnMainLine: node?.isOnMainLine ?? true,
+          });
+        }
+
+        // Always render the dot - no conditions
         return (
           <circle
             key={`dot-${commit.commit}`}
-            cx={pos.x}
-            cy={pos.y}
+            cx={x}
+            cy={y}
             r={dotRadius}
             fill={color}
             stroke="white"
