@@ -28,6 +28,7 @@ export function getBranchColor(branchName: string, branchIndex: number = 0): str
 
 /**
  * Parse refs to extract branch names (local branches only, matching GitTree logic)
+ * Handles remote branches by stripping "origin/" prefix
  */
 function parseBranchRefs(refs: string): string[] {
   if (!refs || !refs.trim()) {
@@ -40,19 +41,39 @@ function parseBranchRefs(refs: string): string[] {
     .filter(ref => ref.length > 0);
 
   const branches: string[] = [];
+  const seenLocalBranches = new Set<string>();
 
   for (const ref of refsList) {
     if (ref === 'HEAD' || ref.endsWith(' -> HEAD')) {
       continue;
     }
 
+    let branchName: string | null = null;
+
     if (ref.includes(' -> ')) {
-      const branchName = ref.split(' -> ')[1].trim();
-      if (branchName && branchName !== 'HEAD' && !branchName.includes('/')) {
-        branches.push(branchName);
+      branchName = ref.split(' -> ')[1].trim();
+      if (branchName === 'HEAD') {
+        continue;
       }
-    } else if (!ref.includes('/')) {
-      branches.push(ref);
+    } else {
+      branchName = ref;
+    }
+
+    if (!branchName) continue;
+
+    // Handle remote branches: strip "origin/" prefix
+    let localBranchName = branchName;
+    if (branchName.startsWith('origin/')) {
+      localBranchName = branchName.substring(7); // Remove "origin/" prefix
+    }
+
+    // Only add if it's a local branch (no remaining slashes) and we haven't seen the local name yet
+    // Prefer local branch over remote branch if both exist
+    if (!localBranchName.includes('/') && localBranchName !== 'HEAD') {
+      if (!seenLocalBranches.has(localBranchName)) {
+        branches.push(localBranchName);
+        seenLocalBranches.add(localBranchName);
+      }
     }
   }
 
@@ -79,11 +100,11 @@ export function createBranchColorMap(commits: Array<{ refs: string }>): Map<stri
     }
   }
   
-  // Process commits in order (matching GitTree's logic)
-  // GitTree assigns colors based on branchColors.size when first encountered
-  let branchCount = 0; // Count of non-main branches
+  // Process commits in REVERSE order (newest first) to match GitTree's logic exactly
+  // GitTree processes commits in reverse order and assigns colors based on branchColors.size when first encountered
+  const commitsReversed = [...commits].reverse();
   
-  commits.forEach((commit) => {
+  commitsReversed.forEach((commit) => {
     const branchRefs = parseBranchRefs(commit.refs);
     
     if (branchRefs.length > 0) {
@@ -92,15 +113,20 @@ export function createBranchColorMap(commits: Array<{ refs: string }>): Map<stri
       if (!branchColorMap.has(primaryBranch)) {
         if (primaryBranch === mainBranch) {
           branchColorMap.set(primaryBranch, BRANCH_COLORS[0]); // Blue for main
+          console.log(`branch-colors: Assigned ${primaryBranch} -> ${BRANCH_COLORS[0]} (main, index 0)`);
         } else {
-          // Match GitTree logic: (branchColors.size % (BRANCH_COLORS.length - 1)) + 1
-          const colorIndex = (branchCount % (BRANCH_COLORS.length - 1)) + 1;
-          branchColorMap.set(primaryBranch, BRANCH_COLORS[colorIndex]);
-          branchCount++;
+          // Match GitTree logic exactly: (branchColors.size % (BRANCH_COLORS.length - 1)) + 1
+          // where branchColors.size is the number of branches already assigned (including main)
+          const colorIndex = (branchColorMap.size % (BRANCH_COLORS.length - 1)) + 1;
+          const color = BRANCH_COLORS[colorIndex];
+          branchColorMap.set(primaryBranch, color);
+          console.log(`branch-colors: Assigned ${primaryBranch} -> ${color} (index ${colorIndex}, branchColorMap.size=${branchColorMap.size})`);
         }
       }
     }
   });
+  
+  console.log('branch-colors: Final branchColorMap:', Array.from(branchColorMap.entries()));
   
   return branchColorMap;
 }
