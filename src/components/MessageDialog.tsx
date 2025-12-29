@@ -104,7 +104,7 @@ export function MessageDialog({
                       <div className="flex-1 mb-4 text-sm">
                         {message}
                       </div>
-                      <div className="flex justify-end">
+                      <div className="flex justify-end mt-auto pt-4">
                         <Button onClick={handleNext}>
                           {index === messages.length - 1 ? lastButtonLabel : "Got it"}
                         </Button>

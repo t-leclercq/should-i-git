@@ -256,15 +256,16 @@ export function GitWindow(props: GitWindowProps = {}) {
         setTimeout(() => {
           const messages: React.ReactNode[] = hasSameFilesChanged
             ? [
-                "It is recommended to interactively rebase your work on top of the stable branch.",
+                "You should interactively rebase your work on top of the target branch.",
                 <div key="interactive-steps">
-                  <p className="mb-3">This is done in 4 steps :</p>
+                  <p className="mb-3">This is done in 6 steps :</p>
                   <div className="space-y-2">
-                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git checkout feature-branch</code></pre>
+                  <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git checkout feature-branch</code></pre>
                     <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git rebase -i main</code></pre>
                     <pre className="bg-muted p-3 rounded-md overflow-x-auto"><strong>Test your changes</strong></pre>
-                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git commit -m "Merging feature-branch changes to main"</code></pre>
-                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git push origin main --force</code></pre>
+                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git push</code></pre>
+                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git checkout main</code></pre>
+                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git merge feature-branch</code></pre>                  
                   </div>
                 </div>,
                 "It means you will be shown each merge conflict between your changes and the stable branch changes, to be able to decide which change is kept or merged together."
@@ -272,10 +273,14 @@ export function GitWindow(props: GitWindowProps = {}) {
             : [
                 "You should rebase your work on top of the stable branch",
                 <div key="steps">
-                  <p className="mb-3">This is done in 2 steps :</p>
+                  <p className="mb-3">This is done in 6 steps :</p>
                   <div className="space-y-2">
-                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git checkout feature-branch</code></pre>
+                  <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git checkout feature-branch</code></pre>
                     <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git rebase main</code></pre>
+                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><strong>Test your changes</strong></pre>
+                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git push</code></pre>
+                  <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git checkout main</code></pre>
+                    <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git merge feature-branch</code></pre>
                   </div>
                 </div>,
                 "It means putting the stable branch's latest changes first, then your feature changes on top of them."
@@ -316,15 +321,20 @@ export function GitWindow(props: GitWindowProps = {}) {
         // Small delay to ensure drawer is fully closed
         setTimeout(() => {
           const messages: React.ReactNode[] = [
-            "You should reset your branch to a previous commit",
+            <div key="reset-steps">
+              <p className="mb-3">You should reset your branch to a previous commit</p>
+            </div>,
             <div key="reset-steps">
               <p className="mb-3">This is done in two steps:</p>
               <div className="space-y-2">
-                <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git reset --hard yourGoodCommitSHA</code></pre>
+                <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git reset --hard commit</code></pre>
                 <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git push --force</code></pre>
               </div>
             </div>,
-            "It will reset your branch to an earlier state, and by force-pushing, you'll update the branch to that previous version."
+            <div key="reset-steps">
+              <p className="mb-3">It will reset your branch to an earlier state</p>
+              <p className="mb-3">By force-pushing, you'll rewrite the branch history</p>
+            </div>
           ];
           
           setMessageDialogContent(messages);
@@ -342,8 +352,8 @@ export function GitWindow(props: GitWindowProps = {}) {
             <div key="revert-steps">
               <p className="mb-3">This is done in three steps:</p>
               <div className="space-y-2">
-                <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git revert yourGoodCommitSHA</code></pre>
-                <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git commit -m "Rollback to version x.y.z"</code></pre>
+                <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git revert commitSHA</code></pre>
+                <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git commit -m "Rollback"</code></pre>
                 <pre className="bg-muted p-3 rounded-md overflow-x-auto"><code>git push</code></pre>
               </div>
             </div>,
@@ -506,6 +516,12 @@ export function GitWindow(props: GitWindowProps = {}) {
         break;
     }
   }, [activeTab, fetchCommits, fetchBranches, fetchTags]);
+
+  // Automatically fetch data on component mount (initial tab is "commits")
+  React.useEffect(() => {
+    fetchCommits();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run on mount
 
   return (
     <div className="w-full p-6 space-y-4">
